@@ -140,14 +140,16 @@ def query_health_metrics(
     end_time: str | None = None,
     aggregation: Literal["raw", "hour", "day"] = "day",
     limit: int = 200,
+    output_format: Literal["concise", "detailed"] = "concise",
 ) -> dict[str, Any]:
     """Query numeric or categorical Apple Health metric samples over time.
 
     Use for steps, heart rate, HRV, sleep stages, energy, weight, oxygen saturation, and other entries reported by
     `list_available_data`. Metric names are exact exported names; omit them to query all metrics. Times accept ISO-8601
     dates or timestamps and default to the last 7 days. `raw` returns samples, while `hour` and `day` return mechanical
-    aggregates. `limit` is 1-1000. Returns the resolved query window plus records. Validation errors state the accepted
-    format and can be corrected without changing other parameters.
+    aggregates. Set `output_format="detailed"` with `aggregation="raw"` to include the complete original exported sample,
+    including fields not promoted into standard columns. `limit` is 1-1000. Returns the resolved query window plus
+    records. Validation errors state the accepted format and can be corrected without changing other parameters.
     """
     return storage_query_health_metrics(
         get_settings().db_path,
@@ -156,6 +158,7 @@ def query_health_metrics(
         end_time=end_time,
         aggregation=aggregation,
         limit=limit,
+        output_format=output_format,
     )
 
 

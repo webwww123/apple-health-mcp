@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from apple_health_mcp.storage import (
+    backfill_metric_normalization,
     health_overview,
     list_available_data,
     query_health_events,
@@ -40,6 +41,8 @@ PAYLOAD = {
                     {
                         "source": "Apple Watch",
                         "date": "2026-07-18T00:00:00+02:00",
+                        "inBedStart": "2026-07-17T22:45:00+02:00",
+                        "inBedEnd": "2026-07-18T07:15:00+02:00",
                         "sleepStart": "2026-07-17T23:00:00+02:00",
                         "sleepEnd": "2026-07-18T07:00:00+02:00",
                         "totalSleep": 7.5,
@@ -94,6 +97,17 @@ def test_ingestion_deduplication_and_queries(tmp_path: Path) -> None:
     )
     assert any(record["value_text"] == "Deep" for record in raw_metrics["records"])
 
+    detailed_sleep = query_health_metrics(
+        db_path,
+        metric_names=["sleep_analysis"],
+        start_time="2026-07-17",
+        end_time="2026-07-18",
+        aggregation="raw",
+        output_format="detailed",
+    )
+    summary = next(record for record in detailed_sleep["records"] if "totalSleep" in record["payload"])
+    assert summary["payload"]["inBedStart"] == "2026-07-17T22:45:00+02:00"
+
     deep_sleep = query_health_metrics(
         db_path,
         metric_names=["sleep_analysis.deep"],
@@ -117,3 +131,26 @@ def test_ingestion_deduplication_and_queries(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="ISO-8601"):
         query_health_metrics(db_path, start_time="not-a-date")
+
+    with pytest.raises(ValueError, match="requires aggregation='raw'"):
+        query_health_metrics(db_path, output_format="detailed")
+
+    updated_payload = json.loads(raw)
+    updated_payload["data"]["metrics"][0]["data"][0]["qty"] = 1500
+    updated_raw = json.dumps(updated_payload)
+    update = store_ingestion(db_path, updated_payload, updated_raw, {"session-id": "session-2"})
+    assert update["duplicate"] is False
+
+    latest_steps = query_health_metrics(
+        db_path,
+        metric_names=["step_count"],
+        start_time="2026-07-16",
+        end_time="2026-07-18",
+        aggregation="raw",
+    )
+    assert latest_steps["record_count"] == 1
+    assert latest_steps["records"][0]["numeric_value"] == 1500
+
+    rebuilt = backfill_metric_normalization(db_path)
+    assert rebuilt["metric_samples_after"] == 10
+    assert rebuilt["events_after"] == 1

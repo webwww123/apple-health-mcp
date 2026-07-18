@@ -47,6 +47,11 @@ The server exposes four read-only tools:
 - `AppleHealth:query_health_events`
 - `AppleHealth:get_health_overview`
 
+For lossless field access, call `AppleHealth:query_health_metrics` with `aggregation="raw"` and
+`output_format="detailed"`. The response then includes the complete original exported sample alongside normalized
+columns. Overlapping exports are reconciled by metric/source/time bucket so the latest value is queried while every
+original request remains retained for audit and future reprocessing.
+
 ## Operations
 
 ```bash
