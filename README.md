@@ -67,8 +67,14 @@ Fallback/debug tools:
 - `AppleHealth:query_health_metrics`
 - `AppleHealth:query_health_events`
 
-Scene tools return a common envelope with `status`, requested/actual coverage, semantic `summary`, personal-baseline
-comparison, bounded highlights, and data quality. Default timestamps use `Asia/Shanghai`; missing values remain `null`.
+Scene tools return a common envelope with `status`, requested/actual ranges, semantic `summary`, personal-baseline
+comparison, bounded highlights, `fetch`, `coverage`, `period`, and data quality. `fetch.complete` means the server query
+was not truncated; it does not claim every requested day has data. Current natural days expose `period.is_closed=false`
+and `may_still_update=true`. Default timestamps use `Asia/Shanghai`; missing values remain `null`.
+
+`output_format=concise` omits capabilities, raw payloads, sources, derivation lists, and full difference maps.
+`output_format=detailed` adds semantic quality and normalization metadata, but raw HealthKit payloads remain exclusive to
+the fallback query tools with raw+detailed mode.
 
 ## Semantic HTTP API
 

@@ -209,8 +209,10 @@ def guide() -> dict[str, Any]:
         "important_rules": [
             "普通问题优先专用场景工具，不要先拉list再查询多个底层指标。",
             "默认时区Asia/Shanghai，日期使用YYYY-MM-DD。",
-            "raw/detailed仅用于排查或用户明确要求原始记录。",
+            "场景工具默认concise；detailed仍是有界语义数据，不含原始payload。",
+            "只有fallback raw+detailed用于排查或用户明确要求原始记录。",
             "缺失值是null，不得解释为0。",
+            "fetch.complete表示查询未被截断；coverage.complete表示请求日/晚是否都有数据。",
             "valid_days/valid_nights不足时不得宣称长期趋势。",
             "健康数据仅用于信息总结，不应作为医疗诊断。",
         ],
@@ -228,9 +230,9 @@ def get_sleep_summary(
     """Return one semantic sleep object for the night assigned to its wake date.
 
     Use directly for questions such as "昨晚睡得怎么样". `date` is YYYY-MM-DD in `timezone` (default
-    Asia/Shanghai). The server converts hours to integer minutes, derives in-bed duration only when boundaries exist,
-    joins recovery metrics when requested, compares with prior personal nights, and states coverage/capabilities.
-    It never invents awakenings, WASO, cycles, or stage intervals when they were not uploaded.
+    Asia/Shanghai); all other inputs are optional. The server validates reported boundaries, returns in-bed duration
+    only when explicitly trustworthy, suppresses interval recovery joins for low-confidence boundaries, and compares
+    with prior personal nights. Concise is bounded; detailed adds quality/capability metadata but never raw payloads.
     """
     return semantic_get_sleep_summary(
         get_settings().db_path, date, timezone, include_recovery_metrics, output_format
@@ -261,8 +263,8 @@ def get_recovery_snapshot(
     """Return a recovery context for one wake date using sleep, heart rate, HRV, breathing, oxygen, and wrist temperature.
 
     Use for fatigue, morning training, and recovery questions. Omit `date` to use the latest uploaded sleep night.
-    The server performs only mechanical personal-baseline comparisons and reports missing metrics; it does not produce a
-    medical diagnosis or a fabricated readiness score.
+    Each metric states its value, sample count, query window, and confidence. Fewer than three baseline nights returns
+    insufficient_data without a recovery judgment. The server never produces a medical diagnosis or readiness score.
     """
     return semantic_get_recovery_snapshot(get_settings().db_path, date, timezone, output_format)
 
@@ -276,8 +278,8 @@ def get_daily_activity(
     """Return one local day's semantic activity summary and personal-baseline comparison.
 
     Use for today's or a specified day's steps, distance, active energy, exercise minutes, stand hours, daylight, and
-    uploaded workout summary. `date` is YYYY-MM-DD. Missing workout uploads remain null/empty and are reported in
-    data_quality instead of being treated as zero.
+    uploaded workout summary. `date` is YYYY-MM-DD. `period.is_closed=false` and `may_still_update=true` identify an
+    unfinished current day. Missing values remain null rather than being treated as zero.
     """
     return semantic_get_daily_activity(get_settings().db_path, date, timezone, output_format)
 
@@ -292,7 +294,7 @@ def get_activity_trend(
     """Return semantic activity coverage and trends for the latest 7, 14, or 30 local days.
 
     Use for recent activity-volume questions. Returns valid_days, missing_days, bounded daily averages/totals, and a
-    previous-equal-period personal baseline. Sparse coverage is explicitly partial/insufficient.
+    previous-equal-period personal baseline. A complete database fetch can still have incomplete day coverage.
     """
     return semantic_get_activity_trend(get_settings().db_path, days, timezone, output_format, end_date)
 
@@ -309,9 +311,9 @@ def list_workouts(
     """Return compact workout sessions for the latest 7, 14, or 30 local days.
 
     Use when the user asks which workouts, runs, rides, walks, or gym sessions occurred recently. Results include stable
-    `workout_id` values for follow-up calls, duration, distance, energy, heart rate, speed/pace, per-type counts, period
-    totals, coverage, and a previous-equal-period personal baseline. `workout_type` is an optional exact type returned by
-    this tool. Default concise output never returns route coordinates or raw sensor samples.
+    `workout_id` values for follow-up calls, global duration/energy totals, and independent per-type distance/speed/pace
+    statistics. Anomalous records are retained and flagged but excluded from same-type baselines. `workout_type` is an
+    optional exact type returned by this tool; `limit` defaults to 20. Raw routes/sensor samples are never returned.
     """
     return semantic_list_workouts(
         get_settings().db_path, days, timezone, output_format, end_date, workout_type, limit
@@ -340,16 +342,23 @@ def compare_workouts(
     comparison_workout_id: str | None = None,
     baseline_count: Literal[3, 5, 10] = 5,
     timezone: str = DEFAULT_TIMEZONE,
+    output_format: Literal["concise", "detailed"] = "concise",
 ) -> dict[str, Any]:
     """Compare one workout with another workout or with the user's recent same-type baseline.
 
     Use for questions such as "这次骑行比上次怎样" or "这次跑步表现怎样". Obtain IDs from
     `AppleHealth:list_workouts`. When `comparison_workout_id` is provided, the tool compares those two sessions;
     otherwise it compares `workout_id` with up to `baseline_count` prior workouts of the same type. Returns mechanical
-    absolute/percentage differences with coverage strength, not a medical or readiness judgment.
+    absolute/percentage differences with coverage strength, not a medical or readiness judgment. `baseline_count`
+    defaults to 5 and `output_format` defaults to concise.
     """
     return semantic_compare_workouts(
-        get_settings().db_path, workout_id, comparison_workout_id, baseline_count, timezone
+        get_settings().db_path,
+        workout_id,
+        comparison_workout_id,
+        baseline_count,
+        timezone,
+        output_format,
     )
 
 
@@ -673,6 +682,7 @@ async def api_compare_workouts(request: Request) -> JSONResponse:
             query.get("comparison_workout_id"),
             _query_int(query.get("baseline_count"), 5),
             query.get("timezone", DEFAULT_TIMEZONE),
+            query.get("output_format", "concise"),
         )
     )
 

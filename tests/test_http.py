@@ -87,7 +87,10 @@ def test_ingest_auth_and_health(tmp_path, monkeypatch) -> None:
             headers=mcp_headers,
         )
         assert tools.status_code == 200
-        assert {tool["name"] for tool in tools.json()["result"]["tools"]} == {
+        tool_definitions = {
+            tool["name"]: tool for tool in tools.json()["result"]["tools"]
+        }
+        assert set(tool_definitions) == {
             "guide",
             "get_sleep_summary",
             "get_sleep_trend",
@@ -102,6 +105,15 @@ def test_ingest_auth_and_health(tmp_path, monkeypatch) -> None:
             "query_health_events",
             "get_health_overview",
         }
+        assert tool_definitions["get_sleep_summary"]["inputSchema"]["required"] == ["date"]
+        sleep_properties = tool_definitions["get_sleep_summary"]["inputSchema"]["properties"]
+        assert sleep_properties["timezone"]["default"] == "Asia/Shanghai"
+        assert sleep_properties["output_format"]["default"] == "concise"
+        assert sleep_properties["include_recovery_metrics"]["default"] is True
+        assert tool_definitions["get_sleep_trend"]["inputSchema"].get("required", []) == []
+        assert tool_definitions["list_workouts"]["inputSchema"].get("required", []) == []
+        assert tool_definitions["list_workouts"]["inputSchema"]["properties"]["limit"]["default"] == 20
+        assert tool_definitions["compare_workouts"]["inputSchema"]["properties"]["baseline_count"]["default"] == 5
 
         called = client.post(
             "/mcp",
@@ -146,6 +158,25 @@ def test_ingest_auth_and_health(tmp_path, monkeypatch) -> None:
         )
         assert sleep.status_code == 200
         assert sleep.json()["result"]["isError"] is False
+
+        minimal_calls = [
+            (6, "get_sleep_trend", {"nights": 7}),
+            (7, "get_daily_activity", {"date": "2026-07-18"}),
+            (8, "list_workouts", {"days": 7}),
+        ]
+        for call_id, tool_name, arguments in minimal_calls:
+            response = client.post(
+                "/mcp",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": call_id,
+                    "method": "tools/call",
+                    "params": {"name": tool_name, "arguments": arguments},
+                },
+                headers=mcp_headers,
+            )
+            assert response.status_code == 200
+            assert response.json()["result"]["isError"] is False
 
         api_unauthorized = client.get("/api/v1/health/capabilities")
         assert api_unauthorized.status_code == 401
