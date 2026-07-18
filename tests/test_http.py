@@ -89,6 +89,11 @@ def test_ingest_auth_and_health(tmp_path, monkeypatch) -> None:
         assert tools.status_code == 200
         assert {tool["name"] for tool in tools.json()["result"]["tools"]} == {
             "guide",
+            "get_sleep_summary",
+            "get_sleep_trend",
+            "get_recovery_snapshot",
+            "get_daily_activity",
+            "get_activity_trend",
             "list_available_data",
             "query_health_metrics",
             "query_health_events",
@@ -121,5 +126,33 @@ def test_ingest_auth_and_health(tmp_path, monkeypatch) -> None:
         assert guided.status_code == 200
         assert guided.json()["result"]["isError"] is False
         guide_text = json.dumps(guided.json(), ensure_ascii=False)
+        assert "AppleHealth:get_sleep_summary" in guide_text
         assert "AppleHealth:get_health_overview" in guide_text
-        assert "AppleHealth:query_health_metrics" in guide_text
+
+        sleep = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {"name": "get_sleep_summary", "arguments": {"date": "2026-07-18"}},
+            },
+            headers=mcp_headers,
+        )
+        assert sleep.status_code == 200
+        assert sleep.json()["result"]["isError"] is False
+
+        api_unauthorized = client.get("/api/v1/health/capabilities")
+        assert api_unauthorized.status_code == 401
+
+        api_headers = {"Authorization": f"Bearer {'m' * 48}"}
+        api_capabilities = client.get("/api/v1/health/capabilities", headers=api_headers)
+        assert api_capabilities.status_code == 200
+        assert api_capabilities.json()["capabilities"]["nightly_sleep_totals"] is True
+
+        api_sleep = client.get(
+            "/api/v1/health/sleep/summary?date=2026-07-18",
+            headers=api_headers,
+        )
+        assert api_sleep.status_code == 200
+        assert api_sleep.json()["status"] == "empty"

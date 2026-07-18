@@ -5,10 +5,12 @@ import json
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from tempfile import SpooledTemporaryFile
 from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -18,11 +20,22 @@ from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from .semantic import (
+    DEFAULT_TIMEZONE,
+    capabilities,
+    get_activity_trend as semantic_get_activity_trend,
+    get_daily_activity as semantic_get_daily_activity,
+    get_recovery_snapshot as semantic_get_recovery_snapshot,
+    get_sleep_summary as semantic_get_sleep_summary,
+    get_sleep_trend as semantic_get_sleep_trend,
+    list_available_data_semantic,
+    localize_fallback_metric_result,
+    query_sleep_fallback,
+    semantic_health_overview,
+)
 from .storage import (
-    health_overview as storage_health_overview,
     ingestion_status,
     initialize_database,
-    list_available_data as storage_list_available_data,
     query_health_events as storage_query_health_events,
     query_health_metrics as storage_query_health_metrics,
     store_ingestion,
@@ -82,7 +95,8 @@ class MCPBearerAuthMiddleware:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] == "http" and str(scope.get("path", "")).startswith("/mcp"):
+        path = str(scope.get("path", ""))
+        if scope["type"] == "http" and (path.startswith("/mcp") or path.startswith("/api/")):
             token = _bearer_token(scope.get("headers", []))
             if not _authorized(token, get_settings().mcp_token):
                 response = JSONResponse(
@@ -98,10 +112,10 @@ class MCPBearerAuthMiddleware:
 mcp = FastMCP(
     name="AppleHealth",
     instructions=(
-        "Read-only access to the owner's Apple Health exports. 当用户询问如何使用、有哪些功能或工具选择不明确时，"
-        "先调用 guide，并立即按其建议继续调用数据工具。Use list_available_data before querying unknown metric or "
-        "event names. Treat results as personal health records, minimize disclosure, and never present them as medical "
-        "diagnosis. Aggregates are mechanical summaries of exported samples."
+        "Personal health semantic layer for conversational AI. 普通睡眠、恢复和活动问题必须优先调用专用场景工具，"
+        "一次通常只调用1-2个工具。guide用于工具路由。list_available_data/query_health_metrics/query_health_events"
+        "仅作为上传排查和原始数据调试的fallback。服务器负责时区、清洗、聚合、覆盖率和个人基线机械比较；"
+        "AI负责结合对话解释，禁止医学诊断。"
     ),
     stateless_http=True,
     json_response=True,
@@ -133,74 +147,152 @@ def guide() -> dict[str, Any]:
     """
     return {
         "server": "AppleHealth",
-        "purpose": "读取已上传到服务器的个人 Apple 健康数据；所有数据工具均为只读。",
+        "purpose": "为对话AI提供已经清洗、聚合并带个人基线的健康语义上下文；所有数据工具均为只读。",
         "required_behavior": (
             "根据用户问题选择下方工具并继续调用。guide 只负责导航，不能代替实际健康数据查询。"
         ),
         "recommended_sequence": [
             {
-                "when": "首次使用、用户问有哪些数据，或不知道准确指标名",
-                "tool": "AppleHealth:list_available_data",
-                "arguments": {"output_format": "concise"},
+                "when": "用户问昨晚睡得怎么样",
+                "tool": "AppleHealth:get_sleep_summary",
+                "arguments_example": {"date": "2026-07-18"},
             },
             {
-                "when": "用户要求最近几天的总体健康总结",
+                "when": "用户问最近一周/两周/一月睡眠趋势",
+                "tool": "AppleHealth:get_sleep_trend",
+                "arguments_example": {"nights": 7},
+            },
+            {
+                "when": "用户问疲劳、晨练前恢复状态或今天是否适合高强度运动",
+                "tool": "AppleHealth:get_recovery_snapshot",
+                "arguments_example": {"date": "2026-07-18"},
+            },
+            {
+                "when": "用户问今天的步数、活动量或晨练情况",
+                "tool": "AppleHealth:get_daily_activity",
+                "arguments_example": {"date": "2026-07-18"},
+            },
+            {
+                "when": "用户问最近活动趋势",
+                "tool": "AppleHealth:get_activity_trend",
+                "arguments_example": {"days": 7},
+            },
+            {
+                "when": "用户要求最近7/14/30天的综合健康概览",
                 "tool": "AppleHealth:get_health_overview",
-                "arguments": {"days": 7},
+                "arguments_example": {"days": 7},
             },
             {
-                "when": "用户查询步数、心率、睡眠、HRV、血氧、能量等时间序列",
-                "tool": "AppleHealth:query_health_metrics",
-                "arguments_example": {
-                    "metric_names": ["heart_rate"],
-                    "start_time": "2026-07-16",
-                    "end_time": "2026-07-18",
-                    "aggregation": "hour",
-                    "limit": 200,
-                    "output_format": "concise",
-                },
-            },
-            {
-                "when": "用户需要睡眠原始字段、入床/离床时间或完整导出对象",
-                "tool": "AppleHealth:query_health_metrics",
-                "arguments_example": {
-                    "metric_names": ["sleep_analysis"],
-                    "aggregation": "raw",
-                    "limit": 50,
-                    "output_format": "detailed",
-                },
-            },
-            {
-                "when": "用户查询锻炼、症状、ECG、药物或其他非指标事件",
-                "tool": "AppleHealth:query_health_events",
-                "arguments_example": {
-                    "categories": ["workouts"],
-                    "limit": 100,
-                    "output_format": "concise",
-                },
+                "when": "专用工具无法回答、精确指标名未知、上传排查或明确要求原始记录",
+                "tool": "AppleHealth:list_available_data / query_health_metrics / query_health_events",
+                "arguments_example": {"output_format": "concise"},
             },
         ],
         "important_rules": [
-            "工具名称使用完整命名，例如 AppleHealth:get_health_overview。",
-            "日期使用 ISO-8601，例如 2026-07-18 或 2026-07-18T10:00:00+02:00。",
-            "不知道 metric_names 或 categories 时先调用 AppleHealth:list_available_data。",
-            "output_format=detailed 仅能与 aggregation=raw 一起用于健康指标查询。",
-            "没有返回记录通常表示客户端尚未上传该类别，不代表服务器连接失败。",
+            "普通问题优先专用场景工具，不要先拉list再查询多个底层指标。",
+            "默认时区Asia/Shanghai，日期使用YYYY-MM-DD。",
+            "raw/detailed仅用于排查或用户明确要求原始记录。",
+            "缺失值是null，不得解释为0。",
+            "valid_days/valid_nights不足时不得宣称长期趋势。",
             "健康数据仅用于信息总结，不应作为医疗诊断。",
         ],
+        "capabilities": capabilities(get_settings().db_path),
     }
 
 
+@mcp.tool(name="get_sleep_summary")
+def get_sleep_summary(
+    date: str,
+    timezone: str = DEFAULT_TIMEZONE,
+    include_recovery_metrics: bool = True,
+    output_format: Literal["concise", "detailed"] = "concise",
+) -> dict[str, Any]:
+    """Return one semantic sleep object for the night assigned to its wake date.
+
+    Use directly for questions such as "昨晚睡得怎么样". `date` is YYYY-MM-DD in `timezone` (default
+    Asia/Shanghai). The server converts hours to integer minutes, derives in-bed duration only when boundaries exist,
+    joins recovery metrics when requested, compares with prior personal nights, and states coverage/capabilities.
+    It never invents awakenings, WASO, cycles, or stage intervals when they were not uploaded.
+    """
+    return semantic_get_sleep_summary(
+        get_settings().db_path, date, timezone, include_recovery_metrics, output_format
+    )
+
+
+@mcp.tool(name="get_sleep_trend")
+def get_sleep_trend(
+    nights: Literal[7, 14, 30] = 7,
+    timezone: str = DEFAULT_TIMEZONE,
+    output_format: Literal["concise", "detailed"] = "concise",
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    """Return nightly sleep summaries and a bounded trend for the latest 7, 14, or 30 wake dates.
+
+    Use for recent sleep-trend questions. Returns valid_nights, missing_nights, actual coverage, averages/medians, and
+    trend strength. Fewer than three valid nights always returns insufficient_data and must not be described as a trend.
+    """
+    return semantic_get_sleep_trend(get_settings().db_path, nights, timezone, output_format, end_date)
+
+
+@mcp.tool(name="get_recovery_snapshot")
+def get_recovery_snapshot(
+    date: str | None = None,
+    timezone: str = DEFAULT_TIMEZONE,
+    output_format: Literal["concise", "detailed"] = "concise",
+) -> dict[str, Any]:
+    """Return a recovery context for one wake date using sleep, heart rate, HRV, breathing, oxygen, and wrist temperature.
+
+    Use for fatigue, morning training, and recovery questions. Omit `date` to use the latest uploaded sleep night.
+    The server performs only mechanical personal-baseline comparisons and reports missing metrics; it does not produce a
+    medical diagnosis or a fabricated readiness score.
+    """
+    return semantic_get_recovery_snapshot(get_settings().db_path, date, timezone, output_format)
+
+
+@mcp.tool(name="get_daily_activity")
+def get_daily_activity(
+    date: str,
+    timezone: str = DEFAULT_TIMEZONE,
+    output_format: Literal["concise", "detailed"] = "concise",
+) -> dict[str, Any]:
+    """Return one local day's semantic activity summary and personal-baseline comparison.
+
+    Use for today's or a specified day's steps, distance, active energy, exercise minutes, stand hours, daylight, and
+    uploaded workout summary. `date` is YYYY-MM-DD. Missing workout uploads remain null/empty and are reported in
+    data_quality instead of being treated as zero.
+    """
+    return semantic_get_daily_activity(get_settings().db_path, date, timezone, output_format)
+
+
+@mcp.tool(name="get_activity_trend")
+def get_activity_trend(
+    days: Literal[7, 14, 30] = 7,
+    timezone: str = DEFAULT_TIMEZONE,
+    output_format: Literal["concise", "detailed"] = "concise",
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    """Return semantic activity coverage and trends for the latest 7, 14, or 30 local days.
+
+    Use for recent activity-volume questions. Returns valid_days, missing_days, bounded daily averages/totals, and a
+    previous-equal-period personal baseline. Sparse coverage is explicitly partial/insufficient.
+    """
+    return semantic_get_activity_trend(get_settings().db_path, days, timezone, output_format, end_date)
+
+
 @mcp.tool(name="list_available_data")
-def list_available_data(output_format: Literal["concise", "detailed"] = "concise") -> dict[str, Any]:
+def list_available_data(
+    output_format: Literal["concise", "detailed"] = "concise",
+    timezone: str = DEFAULT_TIMEZONE,
+) -> dict[str, Any]:
     """List health metric names, event categories, coverage, and ingestion status.
 
-    Use this before other AppleHealth tools when the exact exported metric or category names are unknown.
+    Fallback only: use when a specialized scene tool cannot answer, the exact exported metric/category names are
+    unknown, or an upload needs debugging. Do not call this before ordinary sleep, recovery, or activity questions.
     `output_format="concise"` returns names, units, counts, and latest timestamps; `detailed` also returns first
     timestamps. Returns empty lists when the phone has not uploaded data yet. Errors identify database problems and
     are safe to retry after the service is healthy.
     """
-    return storage_list_available_data(get_settings().db_path, output_format)
+    return list_available_data_semantic(get_settings().db_path, output_format, timezone)
 
 
 @mcp.tool(name="query_health_metrics")
@@ -211,25 +303,55 @@ def query_health_metrics(
     aggregation: Literal["raw", "hour", "day"] = "day",
     limit: int = 200,
     output_format: Literal["concise", "detailed"] = "concise",
+    timezone: str = DEFAULT_TIMEZONE,
 ) -> dict[str, Any]:
     """Query numeric or categorical Apple Health metric samples over time.
 
-    Use for steps, heart rate, HRV, sleep stages, energy, weight, oxygen saturation, and other entries reported by
-    `list_available_data`. Metric names are exact exported names; omit them to query all metrics. Times accept ISO-8601
+    Fallback only: use for exact metric debugging or explicit raw record requests after specialized tools cannot answer.
+    Metric names are exact exported names; omit them to query all metrics. Times accept ISO-8601
     dates or timestamps and default to the last 7 days. `raw` returns samples, while `hour` and `day` return mechanical
     aggregates. Set `output_format="detailed"` with `aggregation="raw"` to include the complete original exported sample,
     including fields not promoted into standard columns. `limit` is 1-1000. Returns the resolved query window plus
     records. Validation errors state the accepted format and can be corrected without changing other parameters.
     """
-    return storage_query_health_metrics(
+    requested_names = metric_names or []
+    sleep_names = [name for name in requested_names if name.lower().startswith("sleep_analysis") or any(
+        token in name.lower() for token in ("sleep_stage_timeline", "awaken", "waso", "sleep_cycle")
+    )]
+    non_sleep_names = [name for name in requested_names if name not in sleep_names]
+    sleep_result = None
+    if sleep_names:
+        if output_format == "detailed" and aggregation != "raw":
+            raise ValueError("sleep detailed output requires aggregation='raw'")
+        sleep_result = query_sleep_fallback(
+            get_settings().db_path,
+            sleep_names,
+            start_time=start_time,
+            end_time=end_time,
+            timezone=timezone,
+            output_format=output_format,
+            limit=limit,
+        )
+        if not non_sleep_names:
+            return sleep_result
+    metric_result = storage_query_health_metrics(
         get_settings().db_path,
-        metric_names=metric_names,
+        metric_names=non_sleep_names or metric_names,
         start_time=start_time,
         end_time=end_time,
         aggregation=aggregation,
         limit=limit,
         output_format=output_format,
     )
+    metric_result = localize_fallback_metric_result(metric_result, timezone)
+    if sleep_result is not None:
+        return {
+            "status": "partial" if sleep_result["status"] == "partial" else "ok",
+            "timezone": timezone,
+            "sleep": sleep_result,
+            "other_metrics": metric_result,
+        }
+    return metric_result
 
 
 @mcp.tool(name="query_health_events")
@@ -239,15 +361,17 @@ def query_health_events(
     end_time: str | None = None,
     limit: int = 100,
     output_format: Literal["concise", "detailed"] = "concise",
+    timezone: str = DEFAULT_TIMEZONE,
 ) -> dict[str, Any]:
     """Query non-metric Apple Health records such as workouts, symptoms, ECGs, medications, or cycle events.
 
-    Use event category names returned by `list_available_data`; omit categories to query all. Times accept ISO-8601
+    Fallback only: use for upload debugging or explicit raw event requests. Use event category names returned by
+    `list_available_data`; omit categories to query all. Times accept ISO-8601
     dates or timestamps and default to the last 30 days. `concise` returns identifying fields; `detailed` also returns
     the complete exported event object. `limit` is 1-500. Returns resolved filters and newest events first. Validation
     errors specify the parameter that must be corrected.
     """
-    return storage_query_health_events(
+    result = storage_query_health_events(
         get_settings().db_path,
         categories=categories,
         start_time=start_time,
@@ -255,17 +379,35 @@ def query_health_events(
         limit=limit,
         output_format=output_format,
     )
+    try:
+        zone = ZoneInfo(timezone)
+    except ZoneInfoNotFoundError as error:
+        raise ValueError("timezone must be an IANA name, for example Asia/Shanghai") from error
+    for event in result.get("events", []):
+        for key in ("start_time", "end_time"):
+            value = event.get(key)
+            if value:
+                parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+                event[key] = parsed.astimezone(zone).isoformat(timespec="seconds")
+    result["timezone"] = timezone
+    result["role"] = "fallback_raw_event_query"
+    return result
 
 
 @mcp.tool(name="get_health_overview")
-def get_health_overview(days: int = 7) -> dict[str, Any]:
+def get_health_overview(
+    days: Literal[7, 14, 30] = 7,
+    timezone: str = DEFAULT_TIMEZONE,
+    output_format: Literal["concise", "detailed"] = "concise",
+    end_date: str | None = None,
+) -> dict[str, Any]:
     """Return a compact cross-metric overview for a recent period.
 
-    Use for broad questions such as "summarize my last week" before requesting specific time series. `days` must be
-    1-365 and defaults to 7. Returns per-metric count, average, min, max, total, latest timestamp, and event counts.
-    Values are mechanical summaries whose meaning depends on each metric and unit; they are not medical advice.
+    Use for broad 7/14/30-day context when a narrower sleep, recovery, or activity tool is not sufficient. Returns
+    compact semantic activity, cardiovascular, respiratory, sleep, body/environment, and latest recovery sections.
+    Rate/percentage/temperature metrics never receive meaningless totals. Coverage and baseline strength are explicit.
     """
-    return storage_health_overview(get_settings().db_path, days=days)
+    return semantic_health_overview(get_settings().db_path, days, timezone, output_format, end_date)
 
 
 async def health(request: Request) -> JSONResponse:
@@ -275,6 +417,143 @@ async def health(request: Request) -> JSONResponse:
         return JSONResponse({"ok": True, "service": "apple-health-mcp", **status})
     except Exception:
         return JSONResponse({"ok": False, "service": "apple-health-mcp"}, status_code=503)
+
+
+def _query_bool(value: str | None, default: bool) -> bool:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("boolean query values must be true or false")
+
+
+def _query_int(value: str | None, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError as error:
+        raise ValueError("integer query value is invalid") from error
+
+
+def _semantic_api_response(callable_: Any) -> JSONResponse:
+    try:
+        return JSONResponse(callable_())
+    except ValueError as error:
+        return JSONResponse(
+            {
+                "status": "error",
+                "error": "invalid_request",
+                "message": str(error),
+                "resolution": "Correct the query parameters and retry.",
+            },
+            status_code=400,
+        )
+    except Exception:
+        return JSONResponse(
+            {
+                "status": "error",
+                "error": "semantic_api_failed",
+                "resolution": "Retry later; raw ingestion data remains safely stored.",
+            },
+            status_code=503,
+        )
+
+
+async def api_capabilities(request: Request) -> JSONResponse:
+    del request
+    return JSONResponse({"status": "ok", "capabilities": capabilities(get_settings().db_path)})
+
+
+async def api_sleep_summary(request: Request) -> JSONResponse:
+    query = request.query_params
+    date = query.get("date")
+    if not date:
+        return JSONResponse(
+            {"status": "error", "error": "missing_date", "resolution": "Provide date=YYYY-MM-DD."},
+            status_code=400,
+        )
+    return _semantic_api_response(
+        lambda: semantic_get_sleep_summary(
+            get_settings().db_path,
+            date,
+            query.get("timezone", DEFAULT_TIMEZONE),
+            _query_bool(query.get("include_recovery_metrics"), True),
+            query.get("output_format", "concise"),
+        )
+    )
+
+
+async def api_sleep_trend(request: Request) -> JSONResponse:
+    query = request.query_params
+    return _semantic_api_response(
+        lambda: semantic_get_sleep_trend(
+            get_settings().db_path,
+            _query_int(query.get("nights"), 7),
+            query.get("timezone", DEFAULT_TIMEZONE),
+            query.get("output_format", "concise"),
+            query.get("end_date"),
+        )
+    )
+
+
+async def api_recovery_snapshot(request: Request) -> JSONResponse:
+    query = request.query_params
+    return _semantic_api_response(
+        lambda: semantic_get_recovery_snapshot(
+            get_settings().db_path,
+            query.get("date"),
+            query.get("timezone", DEFAULT_TIMEZONE),
+            query.get("output_format", "concise"),
+        )
+    )
+
+
+async def api_daily_activity(request: Request) -> JSONResponse:
+    query = request.query_params
+    date = query.get("date")
+    if not date:
+        return JSONResponse(
+            {"status": "error", "error": "missing_date", "resolution": "Provide date=YYYY-MM-DD."},
+            status_code=400,
+        )
+    return _semantic_api_response(
+        lambda: semantic_get_daily_activity(
+            get_settings().db_path,
+            date,
+            query.get("timezone", DEFAULT_TIMEZONE),
+            query.get("output_format", "concise"),
+        )
+    )
+
+
+async def api_activity_trend(request: Request) -> JSONResponse:
+    query = request.query_params
+    return _semantic_api_response(
+        lambda: semantic_get_activity_trend(
+            get_settings().db_path,
+            _query_int(query.get("days"), 7),
+            query.get("timezone", DEFAULT_TIMEZONE),
+            query.get("output_format", "concise"),
+            query.get("end_date"),
+        )
+    )
+
+
+async def api_health_overview(request: Request) -> JSONResponse:
+    query = request.query_params
+    return _semantic_api_response(
+        lambda: semantic_health_overview(
+            get_settings().db_path,
+            _query_int(query.get("days"), 7),
+            query.get("timezone", DEFAULT_TIMEZONE),
+            query.get("output_format", "concise"),
+            query.get("end_date"),
+        )
+    )
 
 
 async def ingest(request: Request) -> JSONResponse:
@@ -364,6 +643,13 @@ core_app = Starlette(
     routes=[
         Route("/health", health, methods=["GET"]),
         Route("/ingest", ingest, methods=["POST"]),
+        Route("/api/v1/health/capabilities", api_capabilities, methods=["GET"]),
+        Route("/api/v1/health/sleep/summary", api_sleep_summary, methods=["GET"]),
+        Route("/api/v1/health/sleep/trend", api_sleep_trend, methods=["GET"]),
+        Route("/api/v1/health/recovery/snapshot", api_recovery_snapshot, methods=["GET"]),
+        Route("/api/v1/health/activity/daily", api_daily_activity, methods=["GET"]),
+        Route("/api/v1/health/activity/trend", api_activity_trend, methods=["GET"]),
+        Route("/api/v1/health/overview", api_health_overview, methods=["GET"]),
         Mount("/", app=mcp_http_app),
     ],
     lifespan=lifespan,
