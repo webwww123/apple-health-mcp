@@ -89,6 +89,7 @@ def _seed_semantic_data(db_path: Path) -> None:
                     "units": "ms",
                     "data": [
                         {"source": "Apple Watch", "date": "2026-07-17 07:30:00 +0800", "qty": 42},
+                        {"source": "Apple Watch", "date": "2026-07-17 14:00:00 +0800", "qty": 82.1},
                         {"source": "Apple Watch", "date": "2026-07-18 07:30:00 +0800", "qty": 48},
                     ],
                 },
@@ -240,26 +241,25 @@ def test_sleep_semantic_contract(tmp_path: Path) -> None:
     concise = get_sleep_summary(db_path, "2026-07-18")
     detailed = get_sleep_summary(db_path, "2026-07-18", output_format="detailed")
     assert concise["status"] == "ok"
-    assert concise["timezone"] == "Asia/Shanghai"
-    assert concise["summary"]["sleep_window"]["start"].endswith("+08:00")
-    assert concise["summary"]["sleep_window"]["window_minutes"] == 446
-    assert concise["summary"]["sleep_window"]["total_sleep_minutes"] == 434
-    assert concise["summary"]["sleep_window"]["awake_minutes"] == 12
-    assert concise["summary"]["sleep_window"]["in_bed_minutes"] is None
-    assert concise["summary"]["sleep_window"]["sleep_efficiency_percent"] is None
-    assert concise["summary"]["stages"]["deep_minutes"] == 93
-    assert "stage_percentages" not in concise["summary"]
+    assert concise["summary"]["start"].endswith("+08:00")
+    assert concise["summary"]["total_sleep_minutes"] == 434
+    assert concise["summary"]["awake_minutes"] == 12
+    assert concise["summary"]["deep_minutes"] == 93
+    assert concise["recovery"]["sleeping_heart_rate_avg_bpm"] == 63.0
+    assert concise["baseline"] == {"nights": 1, "strength": "insufficient_data"}
+    assert concise["sleep_session"]["is_closed"] is True
+    assert concise["sleep_session"]["end"].endswith("+08:00")
+    assert concise["ingestion"]["may_still_update"] is True
     assert detailed["summary"]["stage_percentages"]["deep"] == 21.4
-    assert concise["comparison_to_personal_baseline"] == {
-        "baseline_nights": 1,
-        "strength": "insufficient_data",
-    }
+    assert detailed["summary"]["sleep_window"]["in_bed_minutes"] is None
+    assert detailed["sleep_session"]["is_closed"] is True
+    assert "period" not in detailed
     assert "capabilities" not in concise
     assert detailed["capabilities"]["sleep_stage_timeline"] is False
     concise_json = json.dumps(concise, ensure_ascii=False)
     detailed_json = json.dumps(detailed, ensure_ascii=False)
-    assert len(concise_json.encode()) < len(detailed_json.encode()) * 0.7
-    assert len(concise_json.encode()) < 2300
+    assert len(concise_json.encode()) < len(detailed_json.encode()) * 0.5
+    assert len(concise_json.encode()) < 2000
     assert "technical" not in concise_json + detailed_json
     assert "original_payload" not in concise_json + detailed_json
     assert "awakenings_count" not in concise_json
@@ -275,9 +275,18 @@ def test_sleep_semantic_contract(tmp_path: Path) -> None:
         anomalous["data_quality"]["quality_flags"]
     )
     assert anomalous["summary"]["recovery"]["sleeping_heart_rate_avg_bpm"]["value"] is None
+    assert anomalous["summary"]["recovery"]["hrv_near_wake_ms"]["value"] is None
+    assert anomalous["summary"]["recovery"]["hrv_near_wake_ms"]["sample_count"] == 0
+    assert anomalous["summary"]["recovery"]["hrv_near_wake_ms"]["window"]["logic"] == (
+        "not_queried_due_low_wake_boundary_confidence"
+    )
+    assert anomalous["diagnostic_candidates"]["reported_wake_based_hrv"]["value"] == 82.1
+    assert anomalous["diagnostic_candidates"]["reported_wake_based_hrv"]["excluded_from_analysis"] is True
+    anomalous_concise = get_sleep_summary(db_path, "2026-07-17")
+    assert "diagnostic_candidates" not in anomalous_concise
     assert anomalous["session_id"] != concise["session_id"]
 
-    empty = get_sleep_summary(db_path, "2026-07-10")
+    empty = get_sleep_summary(db_path, "2026-07-10", output_format="detailed")
     assert empty["status"] == "empty"
     assert empty["fetch"]["complete"] is True
     assert empty["coverage"]["valid_nights"] == 0
@@ -291,6 +300,7 @@ def test_sleep_semantic_contract(tmp_path: Path) -> None:
     assert trend["coverage"]["missing_nights"] == 5
     assert trend["summary"]["trend_strength"] == "insufficient_data"
     assert trend["summary"]["nights"][0]["session_id"] != trend["summary"]["nights"][1]["session_id"]
+    assert trend["summary"]["nights"][1]["sleep_session"]["is_closed"] is True
 
     sleep_names = [
         "sleep_analysis",
@@ -332,20 +342,40 @@ def test_recovery_activity_and_overview_contracts(tmp_path: Path) -> None:
     _seed_semantic_data(db_path)
 
     recovery = get_recovery_snapshot(db_path, "2026-07-18")
-    assert recovery["status"] == "partial"
-    metrics = recovery["summary"]["recovery_metrics"]
-    assert metrics["sleeping_heart_rate_avg_bpm"]["value"] == 63.0
-    assert metrics["blood_oxygen_min_percent"]["value"] == 95.0
-    assert metrics["wrist_temperature_c"]["value"] == 35.8
-    assert metrics["hrv_near_wake_ms"]["sample_count"] == 1
-    assert "reported_wake_minus_2h_to_plus_2h" in metrics["hrv_near_wake_ms"]["window"]
-    assert recovery["comparison_to_personal_baseline"]["strength"] == "insufficient_data"
-    assert "metrics" not in recovery["comparison_to_personal_baseline"]
+    assert recovery["status"] == "ok"
+    metrics = recovery["summary"]["recovery"]
+    assert metrics["sleeping_heart_rate_avg_bpm"] == 63.0
+    assert metrics["blood_oxygen_min_percent"] == 95.0
+    assert metrics["wrist_temperature_c"] == 35.8
+    assert metrics["hrv_near_wake_ms"] == 48.0
+    assert recovery["baseline"]["strength"] == "insufficient_data"
+    assert recovery["assessment"] == {
+        "status": "insufficient_baseline",
+        "baseline_nights": 1,
+        "minimum_required_nights": 3,
+    }
     assert "个人基线不足，不生成恢复判断" in recovery["highlights"]
 
     recovery_detailed = get_recovery_snapshot(db_path, "2026-07-18", output_format="detailed")
+    detailed_metrics = recovery_detailed["summary"]["recovery_metrics"]
+    assert detailed_metrics["hrv_near_wake_ms"]["sample_count"] == 1
+    assert "trusted_wake_minus_2h_to_plus_2h" in detailed_metrics["hrv_near_wake_ms"]["window"]["logic"]
     assert "metrics" in recovery_detailed["comparison_to_personal_baseline"]
+    assert recovery_detailed["comparison_to_personal_baseline"]["metrics"]["hrv_near_wake_ms"][
+        "baseline_sample_nights"
+    ] == 0
     assert recovery_detailed["data_quality"]["readiness_score_generated"] is False
+    assert len(json.dumps(recovery, ensure_ascii=False).encode()) < len(
+        json.dumps(recovery_detailed, ensure_ascii=False).encode()
+    ) * 0.55
+
+    anomalous_recovery = get_recovery_snapshot(db_path, "2026-07-17", output_format="detailed")
+    anomalous_hrv = anomalous_recovery["summary"]["recovery_metrics"]["hrv_near_wake_ms"]
+    assert anomalous_recovery["status"] == "partial"
+    assert anomalous_hrv["value"] is None
+    assert anomalous_hrv["sample_count"] == 0
+    assert anomalous_hrv["window"]["logic"] == "not_queried_due_low_wake_boundary_confidence"
+    assert anomalous_recovery["diagnostic_candidates"]["reported_wake_based_hrv"]["value"] == 82.1
 
     activity = get_daily_activity(db_path, "2026-07-18")
     assert activity["summary"]["activity"]["step_count"] == 5000
@@ -362,12 +392,21 @@ def test_recovery_activity_and_overview_contracts(tmp_path: Path) -> None:
     assert trend["coverage"]["missing_days"] == 5
 
     overview = semantic_health_overview(db_path, days=7, end_date="2026-07-18")
+    overview_detailed = semantic_health_overview(
+        db_path, days=7, end_date="2026-07-18", output_format="detailed"
+    )
     assert overview["status"] == "partial"
     assert overview["fetch"]["complete"] is True
     assert overview["coverage"]["valid_nights"] == 2
-    assert "total" not in overview["summary"]["cardiovascular"]["heart_rate"]
-    assert "total" not in overview["summary"]["cardiovascular"]["heart_rate_variability"]
-    assert "total" not in overview["summary"]["respiratory"]["blood_oxygen_saturation"]
+    assert overview["summary"]["latest_recovery"]["hrv_near_wake_ms"] == 48.0
+    assert "window" not in json.dumps(overview)
+    assert len(json.dumps(overview, ensure_ascii=False).encode()) < 4000
+    assert len(json.dumps(overview, ensure_ascii=False).encode()) < len(
+        json.dumps(overview_detailed, ensure_ascii=False).encode()
+    ) * 0.55
+    assert "total" not in overview_detailed["summary"]["cardiovascular"]["heart_rate"]
+    assert "total" not in overview_detailed["summary"]["cardiovascular"]["heart_rate_variability"]
+    assert "total" not in overview_detailed["summary"]["respiratory"]["blood_oxygen_saturation"]
 
 
 def test_workout_semantic_contracts(tmp_path: Path) -> None:
@@ -381,19 +420,46 @@ def test_workout_semantic_contracts(tmp_path: Path) -> None:
     assert "average_speed_kmh" not in listed["summary"]["totals"]
     by_type = {item["type"]: item for item in listed["summary"]["by_type"]}
     assert by_type["户外 骑行"]["count"] == 4
-    assert by_type["室内 步行"]["same_type_averages"]["pace_minutes_per_km"] is None
-    assert by_type["传统力量训练"]["same_type_averages"]["average_speed_kmh"] is None
-    assert listed["comparison_to_personal_baseline"]["mode"] == "same_type_only"
+    assert set(by_type["户外 骑行"]) == {
+        "type",
+        "count",
+        "total_duration_minutes",
+        "total_distance_km",
+        "total_active_energy_kcal",
+    }
+    assert "comparison_to_personal_baseline" not in listed
     assert listed["fetch"]["complete"] is True
     latest = listed["summary"]["workouts"][0]
     assert latest["workout_id"] == "ride-18"
+    assert set(latest) == {
+        "workout_id",
+        "type",
+        "start",
+        "duration_minutes",
+        "distance_km",
+        "active_energy_kcal",
+        "average_heart_rate_bpm",
+        "quality_flags",
+    }
     assert "route" not in json.dumps(latest)
 
     indoor = next(item for item in listed["summary"]["workouts"] if item["workout_id"] == "indoor-walk")
-    assert indoor["pace_minutes_per_km"] is None
     assert "distance_too_low_for_reliable_pace" in indoor["quality_flags"]
     strength = next(item for item in listed["summary"]["workouts"] if item["workout_id"] == "strength-short")
     assert {"very_short_workout", "possible_incomplete_workout"} <= set(strength["quality_flags"])
+
+    listed_detailed = list_workouts(
+        db_path, days=7, end_date="2026-07-18", output_format="detailed"
+    )
+    detailed_by_type = {item["type"]: item for item in listed_detailed["summary"]["by_type"]}
+    assert detailed_by_type["室内 步行"]["same_type_averages"]["pace_minutes_per_km"] is None
+    detailed_indoor = next(
+        item for item in listed_detailed["summary"]["workouts"] if item["workout_id"] == "indoor-walk"
+    )
+    assert detailed_indoor["pace_minutes_per_km"] is None
+    assert len(json.dumps(listed, ensure_ascii=False).encode()) < len(
+        json.dumps(listed_detailed, ensure_ascii=False).encode()
+    ) * 0.55
 
     detail = get_workout_detail(db_path, "ride-18", output_format="detailed")
     assert detail["status"] == "partial"

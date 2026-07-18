@@ -168,7 +168,7 @@ def guide() -> dict[str, Any]:
             {
                 "when": "用户问疲劳、晨练前恢复状态或今天是否适合高强度运动",
                 "tool": "AppleHealth:get_recovery_snapshot",
-                "arguments_example": {"date": "2026-07-18"},
+                "arguments_example": {},
             },
             {
                 "when": "用户问今天的步数、活动量或晨练情况",
@@ -241,7 +241,7 @@ def get_sleep_summary(
 
 @mcp.tool(name="get_sleep_trend")
 def get_sleep_trend(
-    nights: Literal[7, 14, 30] = 7,
+    nights: Literal[7, 14, 30],
     timezone: str = DEFAULT_TIMEZONE,
     output_format: Literal["concise", "detailed"] = "concise",
     end_date: str | None = None,
@@ -263,8 +263,9 @@ def get_recovery_snapshot(
     """Return a recovery context for one wake date using sleep, heart rate, HRV, breathing, oxygen, and wrist temperature.
 
     Use for fatigue, morning training, and recovery questions. Omit `date` to use the latest uploaded sleep night.
-    Each metric states its value, sample count, query window, and confidence. Fewer than three baseline nights returns
-    insufficient_data without a recovery judgment. The server never produces a medical diagnosis or readiness score.
+    Concise returns scalar current values plus compact confidence and assessment; detailed adds per-metric sample count,
+    query window, confidence, and comparison. Fewer than three baseline nights returns an insufficient-baseline
+    assessment without changing a successful current-data fetch to partial. No medical diagnosis or readiness score.
     """
     return semantic_get_recovery_snapshot(get_settings().db_path, date, timezone, output_format)
 
@@ -286,7 +287,7 @@ def get_daily_activity(
 
 @mcp.tool(name="get_activity_trend")
 def get_activity_trend(
-    days: Literal[7, 14, 30] = 7,
+    days: Literal[7, 14, 30],
     timezone: str = DEFAULT_TIMEZONE,
     output_format: Literal["concise", "detailed"] = "concise",
     end_date: str | None = None,
@@ -301,7 +302,7 @@ def get_activity_trend(
 
 @mcp.tool(name="list_workouts")
 def list_workouts(
-    days: Literal[7, 14, 30] = 7,
+    days: Literal[7, 14, 30],
     timezone: str = DEFAULT_TIMEZONE,
     output_format: Literal["concise", "detailed"] = "concise",
     end_date: str | None = None,
@@ -311,9 +312,9 @@ def list_workouts(
     """Return compact workout sessions for the latest 7, 14, or 30 local days.
 
     Use when the user asks which workouts, runs, rides, walks, or gym sessions occurred recently. Results include stable
-    `workout_id` values for follow-up calls, global duration/energy totals, and independent per-type distance/speed/pace
-    statistics. Anomalous records are retained and flagged but excluded from same-type baselines. `workout_type` is an
-    optional exact type returned by this tool; `limit` defaults to 20. Raw routes/sensor samples are never returned.
+    `workout_id` values for follow-up calls, global duration/energy totals, and independent per-type totals. Detailed
+    adds same-type speed/pace statistics and normalization. Anomalous records are retained and flagged but excluded
+    from baselines. `workout_type` is optional; `limit` defaults to 20. Raw routes/sensor samples are never returned.
     """
     return semantic_list_workouts(
         get_settings().db_path, days, timezone, output_format, end_date, workout_type, limit
@@ -479,7 +480,7 @@ def query_health_events(
 
 @mcp.tool(name="get_health_overview")
 def get_health_overview(
-    days: Literal[7, 14, 30] = 7,
+    days: Literal[7, 14, 30],
     timezone: str = DEFAULT_TIMEZONE,
     output_format: Literal["concise", "detailed"] = "concise",
     end_date: str | None = None,

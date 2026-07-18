@@ -121,6 +121,18 @@ def _period_state(end_date: Date, zone: ZoneInfo) -> dict[str, bool]:
     return {"is_closed": is_closed, "may_still_update": not is_closed}
 
 
+def _sleep_session_state(session: dict[str, Any], zone: ZoneInfo) -> dict[str, Any]:
+    trusted_end = session.get("trusted_end")
+    return {
+        "is_closed": (
+            datetime.now(zone) >= trusted_end.astimezone(zone)
+            if trusted_end is not None
+            else None
+        ),
+        "end": _local_iso(trusted_end, zone),
+    }
+
+
 def _quality_payload(
     output_format: str,
     *,
@@ -406,7 +418,6 @@ def _recovery_for_session(
 ) -> dict[str, dict[str, Any]]:
     trusted_start = session.get("trusted_start")
     trusted_end = session.get("trusted_end")
-    reported_end = session.get("reported_end")
     boundary_confidence = session.get("boundary_confidence", "low")
     trusted_interval = trusted_start is not None and trusted_end is not None and boundary_confidence == "high"
 
@@ -431,20 +442,18 @@ def _recovery_for_session(
     )
     sleep_confidence = "high" if trusted_interval else "low"
 
-    hrv_start = reported_end - timedelta(hours=2) if reported_end else None
-    hrv_end = reported_end + timedelta(hours=2) if reported_end else None
+    hrv_start = trusted_end - timedelta(hours=2) if trusted_interval else None
+    hrv_end = trusted_end + timedelta(hours=2) if trusted_interval else None
     hrv_rows = (
         _metric_rows(db_path, "heart_rate_variability", hrv_start, hrv_end)
         if hrv_start and hrv_end
         else []
     )
     hrv_values = [_row_value(row) for row in hrv_rows]
-    hrv_confidence = (
-        "medium" if boundary_confidence == "high" and len(hrv_values) >= 2 else "low"
-    )
+    hrv_confidence = "medium" if trusted_interval and len(hrv_values) >= 2 else "low"
 
-    temperature_start = reported_end - timedelta(hours=18) if reported_end else None
-    temperature_end = reported_end + timedelta(hours=6) if reported_end else None
+    temperature_start = trusted_end - timedelta(hours=18) if trusted_interval else None
+    temperature_end = trusted_end + timedelta(hours=6) if trusted_interval else None
     temperature_rows = (
         _metric_rows(
             db_path,
@@ -456,11 +465,11 @@ def _recovery_for_session(
         else []
     )
     temperature_value = None
-    if temperature_rows and reported_end:
+    if temperature_rows and trusted_end:
         closest = min(
             temperature_rows,
             key=lambda row: abs(
-                ((_parse_datetime(row["start_time"]) or reported_end) - reported_end).total_seconds()
+                ((_parse_datetime(row["start_time"]) or trusted_end) - trusted_end).total_seconds()
             ),
         )
         temperature_value = _round(_row_value(closest), 2)
@@ -523,7 +532,11 @@ def _recovery_for_session(
             hrv_start,
             hrv_end,
             zone,
-            "mean_of_samples_within_reported_wake_minus_2h_to_plus_2h",
+            (
+                "mean_of_samples_within_trusted_wake_minus_2h_to_plus_2h"
+                if trusted_interval
+                else "not_queried_due_low_wake_boundary_confidence"
+            ),
             hrv_confidence,
         ),
         "wrist_temperature_c": _recovery_metric(
@@ -533,31 +546,74 @@ def _recovery_for_session(
             temperature_start,
             temperature_end,
             zone,
-            "closest_absolute_sleeping_wrist_temperature_to_reported_wake",
-            "medium" if boundary_confidence == "high" else "low",
+            (
+                "closest_absolute_sleeping_wrist_temperature_to_trusted_wake"
+                if trusted_interval
+                else "not_queried_due_low_wake_boundary_confidence"
+            ),
+            "medium" if trusted_interval else "low",
         ),
     }
 
 
-def _compact_recovery_metrics(
-    metrics: dict[str, dict[str, Any]],
-    *,
-    include_units: bool = True,
-    include_sample_counts: bool = True,
-) -> dict[str, dict[str, Any]]:
-    result: dict[str, dict[str, Any]] = {}
-    for name, metric in metrics.items():
-        compact: dict[str, Any] = {
-            "value": metric.get("value"),
-            "window": metric.get("window", {}).get("logic"),
-            "confidence": metric.get("confidence"),
+def _reported_wake_diagnostic_candidates(
+    db_path: Path,
+    session: dict[str, Any],
+    zone: ZoneInfo,
+) -> dict[str, Any]:
+    if session.get("boundary_confidence") == "high" and session.get("trusted_end") is not None:
+        return {}
+    reported_end = session.get("reported_end")
+    if reported_end is None:
+        return {}
+
+    candidates: dict[str, Any] = {}
+    hrv_start = reported_end - timedelta(hours=2)
+    hrv_end = reported_end + timedelta(hours=2)
+    hrv_rows = _metric_rows(db_path, "heart_rate_variability", hrv_start, hrv_end)
+    hrv_values = [_row_value(row) for row in hrv_rows]
+    if hrv_rows:
+        candidates["reported_wake_based_hrv"] = {
+            "value": _round(_mean(hrv_values), 1),
+            "unit": "ms",
+            "sample_count": len(hrv_rows),
+            "window": {
+                "start": _local_iso(hrv_start, zone),
+                "end": _local_iso(hrv_end, zone),
+            },
+            "reported_wake_time": _local_iso(reported_end, zone),
+            "excluded_from_analysis": True,
+            "reason": "low_wake_boundary_confidence",
         }
-        if include_units:
-            compact["unit"] = metric.get("unit")
-        if include_sample_counts or name == "hrv_near_wake_ms":
-            compact["sample_count"] = metric.get("sample_count")
-        result[name] = compact
-    return result
+
+    temperature_start = reported_end - timedelta(hours=18)
+    temperature_end = reported_end + timedelta(hours=6)
+    temperature_rows = _metric_rows(
+        db_path,
+        "apple_sleeping_wrist_temperature",
+        temperature_start,
+        temperature_end,
+    )
+    if temperature_rows:
+        closest = min(
+            temperature_rows,
+            key=lambda row: abs(
+                ((_parse_datetime(row["start_time"]) or reported_end) - reported_end).total_seconds()
+            ),
+        )
+        candidates["reported_wake_based_wrist_temperature"] = {
+            "value": _round(_row_value(closest), 2),
+            "unit": "degC",
+            "sample_count": len(temperature_rows),
+            "window": {
+                "start": _local_iso(temperature_start, zone),
+                "end": _local_iso(temperature_end, zone),
+            },
+            "reported_wake_time": _local_iso(reported_end, zone),
+            "excluded_from_analysis": True,
+            "reason": "low_wake_boundary_confidence",
+        }
+    return candidates
 
 
 def _recovery_value(metrics: dict[str, dict[str, Any]], name: str) -> float | None:
@@ -632,14 +688,6 @@ def _sleep_summary_payload(
     }
     baseline = _sleep_baseline(all_sessions, session["sleep_date"])
     full_comparison = _sleep_comparison(session, baseline)
-    concise_comparison: dict[str, Any] = {
-        "baseline_nights": len(baseline),
-        "strength": full_comparison["strength"],
-    }
-    if len(baseline) >= 3:
-        concise_comparison["total_sleep_difference_minutes"] = full_comparison[
-            "total_sleep_difference_minutes"
-        ]
     recovery = _recovery_for_session(db_path, session, zone) if include_recovery_metrics else None
     recovery_missing = [
         key for key, metric in (recovery or {}).items() if metric.get("value") is None
@@ -652,6 +700,57 @@ def _sleep_summary_payload(
     reported_end = _local_iso(session.get("reported_end"), zone)
     trusted_start = _local_iso(session.get("trusted_start"), zone)
     trusted_end = _local_iso(session.get("trusted_end"), zone)
+    latest_ingestion = _latest_ingestion(db_path, zone)
+    sleep_session = _sleep_session_state(session, zone)
+    ingestion_may_update = _period_state(_parse_date(session["sleep_date"]), zone)[
+        "may_still_update"
+    ]
+
+    if output_format == "concise":
+        concise_summary = {
+            "start": trusted_start,
+            "end": trusted_end,
+            "total_sleep_minutes": total,
+            "awake_minutes": session.get("awake_minutes"),
+            "deep_minutes": session.get("deep_minutes"),
+            "rem_minutes": session.get("rem_minutes"),
+            "core_minutes": session.get("core_minutes"),
+            "boundary_confidence": session.get("boundary_confidence"),
+        }
+        response: dict[str, Any] = {
+            "status": status,
+            "sleep_date": session["sleep_date"],
+            "session_id": session.get("session_id"),
+            "summary": concise_summary,
+            "baseline": {
+                "nights": len(baseline),
+                "strength": full_comparison["strength"],
+            },
+            "sleep_session": sleep_session,
+            "ingestion": {
+                "may_still_update": ingestion_may_update,
+                "latest_ingestion": latest_ingestion,
+            },
+            "highlights": _sleep_highlights(session, len(baseline)),
+            "data_quality": {
+                "complete": complete,
+                "may_still_update": ingestion_may_update,
+            },
+        }
+        if include_recovery_metrics:
+            response["recovery"] = {
+                "sleeping_heart_rate_avg_bpm": _recovery_value(
+                    recovery or {}, "sleeping_heart_rate_avg_bpm"
+                ),
+                "respiratory_rate_avg_per_min": _recovery_value(
+                    recovery or {}, "respiratory_rate_avg_per_min"
+                ),
+                "blood_oxygen_avg_percent": _recovery_value(
+                    recovery or {}, "blood_oxygen_avg_percent"
+                ),
+            }
+        return response
+
     summary: dict[str, Any] = {
         "sleep_window": {
             "reported_start": reported_start,
@@ -668,21 +767,14 @@ def _sleep_summary_payload(
         "stages": stage_values,
     }
     if include_recovery_metrics:
-        summary["recovery"] = (
-            recovery
-            if output_format == "detailed"
-            else _compact_recovery_metrics(
-                recovery or {}, include_units=False, include_sample_counts=False
-            )
-        )
-    if output_format == "detailed":
-        summary["stage_percentages"] = stage_percentages
-        summary["reported_boundaries"] = {
-            "reported_span_minutes": session.get("reported_window_minutes"),
-            "reported_in_bed_start": _local_iso(session.get("in_bed_start"), zone),
-            "reported_in_bed_end": _local_iso(session.get("in_bed_end"), zone),
-            "unclassified_gap_minutes": session.get("unclassified_gap_minutes"),
-        }
+        summary["recovery"] = recovery
+    summary["stage_percentages"] = stage_percentages
+    summary["reported_boundaries"] = {
+        "reported_span_minutes": session.get("reported_window_minutes"),
+        "reported_in_bed_start": _local_iso(session.get("in_bed_start"), zone),
+        "reported_in_bed_end": _local_iso(session.get("in_bed_end"), zone),
+        "unclassified_gap_minutes": session.get("unclassified_gap_minutes"),
+    }
     coverage = {"complete": True, "valid_nights": 1, "missing_nights": 0}
     response: dict[str, Any] = {
         "status": status,
@@ -697,18 +789,20 @@ def _sleep_summary_payload(
             "trusted_end": trusted_end,
         },
         "summary": summary,
-        "comparison_to_personal_baseline": (
-            full_comparison if output_format == "detailed" else concise_comparison
-        ),
+        "comparison_to_personal_baseline": full_comparison,
         "highlights": _sleep_highlights(session, len(baseline)),
         "fetch": {"complete": True},
         "coverage": coverage,
-        "period": _period_state(_parse_date(session["sleep_date"]), zone),
+        "sleep_session": sleep_session,
+        "ingestion": {
+            "may_still_update": ingestion_may_update,
+            "latest_ingestion": latest_ingestion,
+        },
         "data_quality": _quality_payload(
-            output_format,
+            "detailed",
             complete=complete,
             coverage=coverage,
-            latest_ingestion=_latest_ingestion(db_path, zone),
+            latest_ingestion=latest_ingestion,
             details={
                 "sources": [session["source"]] if session.get("source") else [],
                 "derived_fields": session["derived_fields"],
@@ -719,9 +813,11 @@ def _sleep_summary_payload(
                 "unclassified_gap_minutes": session.get("unclassified_gap_minutes"),
             },
         ),
+        "capabilities": capabilities(db_path),
     }
-    if output_format == "detailed":
-        response["capabilities"] = capabilities(db_path)
+    diagnostic_candidates = _reported_wake_diagnostic_candidates(db_path, session, zone)
+    if diagnostic_candidates:
+        response["diagnostic_candidates"] = diagnostic_candidates
     return response
 
 
@@ -739,6 +835,22 @@ def get_sleep_summary(
     session = next((item for item in sessions if item["sleep_date"] == target.isoformat()), None)
     if session is None:
         coverage = {"complete": False, "valid_nights": 0, "missing_nights": 1}
+        latest_ingestion = _latest_ingestion(db_path, zone)
+        may_still_update = _period_state(target, zone)["may_still_update"]
+        if output_format == "concise":
+            return {
+                "status": "empty",
+                "sleep_date": target.isoformat(),
+                "summary": {},
+                "baseline": {"nights": 0, "strength": "insufficient_data"},
+                "sleep_session": {"is_closed": None, "end": None},
+                "ingestion": {
+                    "may_still_update": may_still_update,
+                    "latest_ingestion": latest_ingestion,
+                },
+                "highlights": ["该醒来日期没有已上传的睡眠记录"],
+                "data_quality": {"complete": False, "may_still_update": may_still_update},
+            }
         response: dict[str, Any] = {
             "status": "empty",
             "sleep_date": target.isoformat(),
@@ -750,12 +862,16 @@ def get_sleep_summary(
             "highlights": ["该醒来日期没有已上传的睡眠记录"],
             "fetch": {"complete": True},
             "coverage": coverage,
-            "period": _period_state(target, zone),
+            "sleep_session": {"is_closed": None, "end": None},
+            "ingestion": {
+                "may_still_update": may_still_update,
+                "latest_ingestion": latest_ingestion,
+            },
             "data_quality": _quality_payload(
                 output_format,
                 complete=False,
                 coverage=coverage,
-                latest_ingestion=_latest_ingestion(db_path, zone),
+                latest_ingestion=latest_ingestion,
                 details={
                     "sources": [],
                     "derived_fields": [],
@@ -809,6 +925,7 @@ def get_sleep_trend(
             "reported_start": _local_iso(item.get("reported_start"), zone),
             "reported_end": _local_iso(item.get("reported_end"), zone),
             "boundary_confidence": item.get("boundary_confidence"),
+            "sleep_session": _sleep_session_state(item, zone),
         }
         for item in selected
     ]
@@ -1211,6 +1328,30 @@ def _compact_workout(workout: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _compact_workout_list_item(workout: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "workout_id": workout.get("workout_id"),
+        "type": workout.get("type"),
+        "start": workout.get("start"),
+        "duration_minutes": workout.get("duration_minutes"),
+        "distance_km": workout.get("distance_km"),
+        "active_energy_kcal": workout.get("active_energy_kcal"),
+        "average_heart_rate_bpm": workout.get("heart_rate_bpm", {}).get("average"),
+        "quality_flags": workout.get("quality_flags", []),
+    }
+
+
+def _compact_workout_type_stats(stats: dict[str, Any]) -> dict[str, Any]:
+    totals = stats.get("totals", {})
+    return {
+        "type": stats.get("type"),
+        "count": stats.get("count"),
+        "total_duration_minutes": totals.get("duration_minutes"),
+        "total_distance_km": totals.get("distance_km"),
+        "total_active_energy_kcal": totals.get("active_energy_kcal"),
+    }
+
+
 def _workout_averages(workouts: list[dict[str, Any]]) -> dict[str, float | None]:
     baseline_blocking_flags = {
         "distance_too_low_for_reliable_pace",
@@ -1400,8 +1541,16 @@ def list_workouts(
                 _sum_optional([_number(item.get("active_energy_kcal")) for item in workouts]), 1
             ),
         },
-        "by_type": type_stats,
-        "workouts": workouts if output_format == "detailed" else [_compact_workout(item) for item in workouts],
+        "by_type": (
+            type_stats
+            if output_format == "detailed"
+            else [_compact_workout_type_stats(item) for item in type_stats]
+        ),
+        "workouts": (
+            workouts
+            if output_format == "detailed"
+            else [_compact_workout_list_item(item) for item in workouts]
+        ),
     }
     status = "empty" if not workouts else "ok" if semantic_complete else "partial"
     highlights = (
@@ -1421,6 +1570,24 @@ def list_workouts(
         "workout_days": len(workout_dates),
         "note": "没有锻炼的日期不等于缺失数据",
     }
+    latest_ingestion = _latest_ingestion(db_path, zone)
+    if output_format == "concise":
+        return {
+            "status": status,
+            "range": {
+                "start_date": start_day.isoformat(),
+                "end_date": end_day.isoformat(),
+                "days": days,
+            },
+            "summary": summary,
+            "highlights": highlights[:3],
+            "fetch": {"complete": not truncated},
+            "period": _period_state(end_day, zone),
+            "data_quality": {
+                "complete": semantic_complete,
+                "latest_ingestion": latest_ingestion,
+            },
+        }
     response: dict[str, Any] = {
         "status": status,
         "timezone": zone.key,
@@ -1450,7 +1617,7 @@ def list_workouts(
             output_format,
             complete=semantic_complete,
             coverage=coverage,
-            latest_ingestion=_latest_ingestion(db_path, zone),
+            latest_ingestion=latest_ingestion,
             details={
                 "sources": sources,
                 "derived_fields": sorted({field for item in quality for field in item["derived_fields"]}),
@@ -1461,8 +1628,7 @@ def list_workouts(
             },
         ),
     }
-    if output_format == "detailed":
-        response["capabilities"] = capabilities(db_path)
+    response["capabilities"] = capabilities(db_path)
     return response
 
 
@@ -1995,6 +2161,10 @@ def _recovery_values_for_session(
     return recovery
 
 
+def _recovery_scalar_values(metrics: dict[str, dict[str, Any]]) -> dict[str, float | None]:
+    return {name: _number(metric.get("value")) for name, metric in metrics.items()}
+
+
 def get_recovery_snapshot(
     db_path: Path,
     date: str | None = None,
@@ -2058,7 +2228,7 @@ def get_recovery_snapshot(
     }
     summary: dict[str, Any] = {
         "sleep": sleep_summary,
-        "recovery_metrics": current if output_format == "detailed" else _compact_recovery_metrics(current),
+        "recovery_metrics": current,
     }
     highlights: list[str] = []
     total = session.get("total_sleep_minutes")
@@ -2071,20 +2241,65 @@ def get_recovery_snapshot(
         highlights.append("个人基线不足，不生成恢复判断")
     if missing_fields:
         highlights.append(f"恢复指标仍缺少{len(missing_fields)}项，结果为部分数据")
-    semantic_complete = (
-        not missing_fields
-        and not session["quality_flags"]
-        and session.get("boundary_confidence") == "high"
-        and len(baseline_sessions) >= 3
+    core_metric_names = (
+        "sleeping_heart_rate_avg_bpm",
+        "respiratory_rate_avg_per_min",
+        "blood_oxygen_avg_percent",
     )
+    current_core_complete = (
+        session.get("total_sleep_minutes") is not None
+        and session.get("boundary_confidence") == "high"
+        and all(_recovery_value(current, name) is not None for name in core_metric_names)
+    )
+    semantic_complete = current_core_complete and not missing_fields
     coverage = {"complete": True, "valid_nights": 1, "missing_nights": 0}
     full_comparison = {
         "baseline_nights": len(baseline_sessions),
         "strength": baseline_strength,
         "metrics": comparisons,
     }
+    assessment = {
+        "status": "baseline_available" if len(baseline_sessions) >= 3 else "insufficient_baseline",
+        "baseline_nights": len(baseline_sessions),
+        "minimum_required_nights": 3,
+    }
+    latest_ingestion = _latest_ingestion(db_path, zone)
+    ingestion_may_update = _period_state(_parse_date(target_date), zone)["may_still_update"]
+    sleep_session = _sleep_session_state(session, zone)
+    status = "ok" if current_core_complete else "partial"
+    if output_format == "concise":
+        low_confidence_metrics = [
+            name for name, metric in current.items() if metric.get("confidence") == "low"
+        ]
+        return {
+            "status": status,
+            "sleep_date": target_date,
+            "summary": {
+                "sleep": sleep_summary,
+                "recovery": _recovery_scalar_values(current),
+            },
+            "quality": {
+                "boundary_confidence": session.get("boundary_confidence"),
+                "low_confidence_metrics": low_confidence_metrics,
+            },
+            "baseline": {
+                "nights": len(baseline_sessions),
+                "strength": baseline_strength,
+            },
+            "assessment": assessment,
+            "sleep_session": sleep_session,
+            "ingestion": {
+                "may_still_update": ingestion_may_update,
+                "latest_ingestion": latest_ingestion,
+            },
+            "highlights": highlights[:3],
+            "data_quality": {
+                "complete": semantic_complete,
+                "missing_metric_count": len(missing_fields),
+            },
+        }
     response: dict[str, Any] = {
-        "status": "ok" if semantic_complete else "partial",
+        "status": status,
         "timezone": zone.key,
         "requested_range": {"date": target_date},
         "actual_data_range": {
@@ -2094,20 +2309,21 @@ def get_recovery_snapshot(
             "trusted_end": _local_iso(session.get("trusted_end"), zone),
         },
         "summary": summary,
-        "comparison_to_personal_baseline": (
-            full_comparison
-            if output_format == "detailed"
-            else {"baseline_nights": len(baseline_sessions), "strength": baseline_strength}
-        ),
+        "comparison_to_personal_baseline": full_comparison,
+        "assessment": assessment,
         "highlights": highlights[:3],
         "fetch": {"complete": True},
         "coverage": coverage,
-        "period": _period_state(_parse_date(target_date), zone),
+        "sleep_session": sleep_session,
+        "ingestion": {
+            "may_still_update": ingestion_may_update,
+            "latest_ingestion": latest_ingestion,
+        },
         "data_quality": _quality_payload(
-            output_format,
+            "detailed",
             complete=semantic_complete,
             coverage=coverage,
-            latest_ingestion=_latest_ingestion(db_path, zone),
+            latest_ingestion=latest_ingestion,
             details={
                 "sources": [session["source"]] if session.get("source") else [],
                 "derived_fields": session["derived_fields"],
@@ -2117,9 +2333,11 @@ def get_recovery_snapshot(
                 "readiness_score_generated": False,
             },
         ),
+        "capabilities": capabilities(db_path),
     }
-    if output_format == "detailed":
-        response["capabilities"] = capabilities(db_path)
+    diagnostic_candidates = _reported_wake_diagnostic_candidates(db_path, session, zone)
+    if diagnostic_candidates:
+        response["diagnostic_candidates"] = diagnostic_candidates
     return response
 
 
@@ -2222,23 +2440,6 @@ def semantic_health_overview(
         "wrist_temperature": wrist_selected,
         "environmental_audio_exposure": select(audio, ("average", "maximum", "latest_time", "unit")),
     }
-    sleep_overview = dict(sleep["summary"])
-    if output_format == "concise":
-        sleep_overview.pop("nights", None)
-    summary: dict[str, Any] = {
-        "activity": activity["summary"],
-        "cardiovascular": cardiovascular,
-        "respiratory": respiratory,
-        "sleep": sleep_overview,
-        "body_environment": body_environment,
-        "latest_recovery_snapshot": recovery["summary"] if recovery["status"] != "empty" else None,
-    }
-    if output_format == "detailed":
-        summary["coverage_details"] = {
-            "activity": activity["data_quality"],
-            "sleep": sleep["data_quality"],
-            "recovery": recovery["data_quality"],
-        }
     valid_days = activity["coverage"]["valid_days"]
     valid_nights = sleep["coverage"]["valid_nights"]
     missing_days = days - min(valid_days, days)
@@ -2257,6 +2458,107 @@ def semantic_health_overview(
         "valid_nights": valid_nights,
         "missing_nights": sleep["coverage"]["missing_nights"],
     }
+    latest_ingestion = _latest_ingestion(db_path, zone)
+    if output_format == "concise":
+        activity_summary = activity["summary"]
+        sleep_summary = sleep["summary"]
+        recovery_summary = recovery.get("summary", {})
+        recovery_sleep = recovery_summary.get("sleep", {})
+        recovery_values = recovery_summary.get("recovery", {})
+        return {
+            "status": status,
+            "range": {
+                "start_date": start_day.isoformat(),
+                "end_date": end_day.isoformat(),
+                "days": days,
+            },
+            "summary": {
+                "activity": {
+                    "valid_days": activity_summary.get("valid_days"),
+                    "average_steps": activity_summary.get("daily_average", {}).get("step_count"),
+                    "average_active_energy_kcal": activity_summary.get("daily_average", {}).get(
+                        "active_energy_kcal"
+                    ),
+                    "average_exercise_minutes": activity_summary.get("daily_average", {}).get(
+                        "exercise_minutes"
+                    ),
+                    "total_steps": activity_summary.get("period_totals", {}).get("step_count"),
+                    "total_distance_km": activity_summary.get("period_totals", {}).get(
+                        "walking_running_distance_km"
+                    ),
+                },
+                "sleep": {
+                    "valid_nights": sleep_summary.get("valid_nights"),
+                    "average_total_sleep_minutes": sleep_summary.get("average_total_sleep_minutes"),
+                    "average_deep_minutes": sleep_summary.get("average_deep_minutes"),
+                    "average_rem_minutes": sleep_summary.get("average_rem_minutes"),
+                    "trend_strength": sleep_summary.get("trend_strength"),
+                },
+                "cardiovascular": {
+                    "heart_rate_average_bpm": (heart_rate or {}).get("average"),
+                    "heart_rate_latest_bpm": (heart_rate or {}).get("latest"),
+                    "resting_heart_rate_latest_bpm": (resting_heart_rate or {}).get("latest"),
+                    "hrv_average_ms": (hrv or {}).get("average"),
+                    "hrv_latest_ms": (hrv or {}).get("latest"),
+                },
+                "respiratory": {
+                    "respiratory_rate_average_per_min": (respiratory_rate or {}).get("average"),
+                    "respiratory_rate_latest_per_min": (respiratory_rate or {}).get("latest"),
+                    "blood_oxygen_average_percent": (oxygen_selected or {}).get("average"),
+                    "blood_oxygen_latest_percent": (oxygen_selected or {}).get("latest"),
+                },
+                "body_environment": {
+                    "wrist_temperature_latest_c": (wrist_selected or {}).get("latest"),
+                    "environmental_audio_average": (audio or {}).get("average"),
+                },
+                "latest_recovery": (
+                    {
+                        "sleep_date": recovery.get("sleep_date"),
+                        "total_sleep_minutes": recovery_sleep.get("total_sleep_minutes"),
+                        "sleeping_heart_rate_avg_bpm": recovery_values.get(
+                            "sleeping_heart_rate_avg_bpm"
+                        ),
+                        "hrv_near_wake_ms": recovery_values.get("hrv_near_wake_ms"),
+                        "respiratory_rate_avg_per_min": recovery_values.get(
+                            "respiratory_rate_avg_per_min"
+                        ),
+                        "blood_oxygen_avg_percent": recovery_values.get(
+                            "blood_oxygen_avg_percent"
+                        ),
+                        "assessment": recovery.get("assessment", {}).get("status"),
+                    }
+                    if recovery["status"] != "empty"
+                    else None
+                ),
+            },
+            "baseline": {
+                "activity_strength": activity["comparison_to_personal_baseline"].get("strength"),
+                "sleep_strength": sleep["comparison_to_personal_baseline"].get("strength"),
+                "recovery_strength": recovery.get("baseline", {}).get("strength"),
+            },
+            "highlights": highlights,
+            "fetch": {"complete": activity["fetch"]["complete"] and sleep["fetch"]["complete"]},
+            "coverage": coverage,
+            "period": period,
+            "data_quality": {
+                "complete": semantic_complete,
+                "latest_ingestion": latest_ingestion,
+            },
+        }
+
+    summary: dict[str, Any] = {
+        "activity": activity["summary"],
+        "cardiovascular": cardiovascular,
+        "respiratory": respiratory,
+        "sleep": sleep["summary"],
+        "body_environment": body_environment,
+        "latest_recovery_snapshot": recovery["summary"] if recovery["status"] != "empty" else None,
+        "coverage_details": {
+            "activity": activity["data_quality"],
+            "sleep": sleep["data_quality"],
+            "recovery": recovery["data_quality"],
+        },
+    }
     full_comparison = {
         "activity": activity["comparison_to_personal_baseline"],
         "sleep": sleep["comparison_to_personal_baseline"],
@@ -2271,24 +2573,16 @@ def semantic_health_overview(
             "sleep": sleep["actual_data_range"],
         },
         "summary": summary,
-        "comparison_to_personal_baseline": (
-            full_comparison
-            if output_format == "detailed"
-            else {
-                "activity_strength": activity["comparison_to_personal_baseline"].get("strength"),
-                "sleep_strength": sleep["comparison_to_personal_baseline"].get("strength"),
-                "recovery_strength": recovery["comparison_to_personal_baseline"].get("strength"),
-            }
-        ),
+        "comparison_to_personal_baseline": full_comparison,
         "highlights": highlights,
         "fetch": {"complete": activity["fetch"]["complete"] and sleep["fetch"]["complete"]},
         "coverage": coverage,
         "period": period,
         "data_quality": _quality_payload(
-            output_format,
+            "detailed",
             complete=semantic_complete,
             coverage=coverage,
-            latest_ingestion=_latest_ingestion(db_path, zone),
+            latest_ingestion=latest_ingestion,
             details={
                 "sources": sorted(
                     set(activity["data_quality"].get("sources", []))
@@ -2299,8 +2593,7 @@ def semantic_health_overview(
             },
         ),
     }
-    if output_format == "detailed":
-        response["capabilities"] = capabilities(db_path)
+    response["capabilities"] = capabilities(db_path)
     return response
 
 

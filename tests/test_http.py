@@ -105,15 +105,31 @@ def test_ingest_auth_and_health(tmp_path, monkeypatch) -> None:
             "query_health_events",
             "get_health_overview",
         }
-        assert tool_definitions["get_sleep_summary"]["inputSchema"]["required"] == ["date"]
+        expected_required = {
+            "get_sleep_summary": ["date"],
+            "get_sleep_trend": ["nights"],
+            "get_recovery_snapshot": [],
+            "get_daily_activity": ["date"],
+            "get_activity_trend": ["days"],
+            "list_workouts": ["days"],
+            "get_workout_detail": ["workout_id"],
+            "compare_workouts": ["workout_id"],
+            "get_health_overview": ["days"],
+        }
+        for tool_name, required in expected_required.items():
+            assert tool_definitions[tool_name]["inputSchema"].get("required", []) == required
         sleep_properties = tool_definitions["get_sleep_summary"]["inputSchema"]["properties"]
         assert sleep_properties["timezone"]["default"] == "Asia/Shanghai"
         assert sleep_properties["output_format"]["default"] == "concise"
         assert sleep_properties["include_recovery_metrics"]["default"] is True
-        assert tool_definitions["get_sleep_trend"]["inputSchema"].get("required", []) == []
-        assert tool_definitions["list_workouts"]["inputSchema"].get("required", []) == []
-        assert tool_definitions["list_workouts"]["inputSchema"]["properties"]["limit"]["default"] == 20
-        assert tool_definitions["compare_workouts"]["inputSchema"]["properties"]["baseline_count"]["default"] == 5
+        assert tool_definitions["get_recovery_snapshot"]["inputSchema"]["properties"]["date"]["default"] is None
+        workout_properties = tool_definitions["list_workouts"]["inputSchema"]["properties"]
+        assert workout_properties["end_date"]["default"] is None
+        assert workout_properties["workout_type"]["default"] is None
+        assert workout_properties["limit"]["default"] == 20
+        compare_properties = tool_definitions["compare_workouts"]["inputSchema"]["properties"]
+        assert compare_properties["comparison_workout_id"]["default"] is None
+        assert compare_properties["baseline_count"]["default"] == 5
 
         called = client.post(
             "/mcp",
@@ -161,8 +177,11 @@ def test_ingest_auth_and_health(tmp_path, monkeypatch) -> None:
 
         minimal_calls = [
             (6, "get_sleep_trend", {"nights": 7}),
-            (7, "get_daily_activity", {"date": "2026-07-18"}),
-            (8, "list_workouts", {"days": 7}),
+            (7, "get_recovery_snapshot", {}),
+            (8, "get_daily_activity", {"date": "2026-07-18"}),
+            (9, "get_activity_trend", {"days": 7}),
+            (10, "list_workouts", {"days": 7}),
+            (11, "get_health_overview", {"days": 7}),
         ]
         for call_id, tool_name, arguments in minimal_calls:
             response = client.post(
