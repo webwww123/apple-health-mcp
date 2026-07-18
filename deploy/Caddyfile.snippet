@@ -1,0 +1,4 @@
+redir /apple-health /apple-health/ 308
+handle_path /apple-health/* {
+	reverse_proxy 172.17.0.1:18193
+}

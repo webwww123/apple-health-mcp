@@ -1,0 +1,45 @@
+[Unit]
+Description=Apple Health ingestion and MCP service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=apple-health
+Group=apple-health
+WorkingDirectory=/opt/apple-health-mcp
+LoadCredential=ingest_token:/etc/apple-health-mcp/ingest-token
+LoadCredential=mcp_token:/etc/apple-health-mcp/mcp-token
+Environment=APPLE_HEALTH_INGEST_TOKEN_FILE=%d/ingest_token
+Environment=APPLE_HEALTH_MCP_TOKEN_FILE=%d/mcp_token
+Environment=APPLE_HEALTH_DB_PATH=/var/lib/apple-health-mcp/health.db
+Environment=APPLE_HEALTH_MAX_BODY_BYTES=134217728
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/apple-health-mcp/.venv/bin/uvicorn apple_health_mcp.app:app --host 172.17.0.1 --port 18193 --proxy-headers --forwarded-allow-ips=172.17.0.0/16 --no-access-log --timeout-keep-alive 10
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/apple-health-mcp
+
+[Install]
+WantedBy=multi-user.target
