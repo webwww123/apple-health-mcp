@@ -209,13 +209,35 @@ def _metric_rows(payload: Any) -> Iterable[dict[str, Any]]:
             raw = _compact_json(sample)
             sample_uuid = _text(_first(sample, "uuid", "id", "identifier"))
             fingerprint_basis = sample_uuid or raw
-            yield {
+            is_sleep_summary = metric_name.lower() == "sleep_analysis" and any(
+                key in sample for key in ("totalSleep", "asleep", "awake", "core", "deep", "rem", "inBed")
+            )
+            start_time = _normalize_time(
+                _first(
+                    sample,
+                    *("sleepStart", "inBedStart", "date")
+                    if is_sleep_summary
+                    else ("startDate", "startTime", "start", "date", "timestamp"),
+                )
+            )
+            end_time = _normalize_time(
+                _first(
+                    sample,
+                    *("sleepEnd", "inBedEnd")
+                    if is_sleep_summary
+                    else ("endDate", "endTime", "end"),
+                )
+            )
+            numeric_value = _number(_first(sample, "qty", "quantity", "numericValue", "value"))
+            if numeric_value is None and is_sleep_summary:
+                numeric_value = _number(_first(sample, "totalSleep"))
+            base_row = {
                 "metric_name": metric_name,
                 "unit": _text(_first(sample, "units", "unit")) or unit,
-                "start_time": _normalize_time(_first(sample, "startDate", "startTime", "start", "date", "timestamp")),
-                "end_time": _normalize_time(_first(sample, "endDate", "endTime", "end")),
+                "start_time": start_time,
+                "end_time": end_time,
                 "source": _text(_first(sample, "source", "sourceName")),
-                "numeric_value": _number(_first(sample, "qty", "quantity", "numericValue", "value")),
+                "numeric_value": numeric_value,
                 "min_value": _number(_first(sample, "min", "minimum", "minValue")),
                 "max_value": _number(_first(sample, "max", "maximum", "maxValue")),
                 "avg_value": _number(_first(sample, "avg", "average", "avgValue")),
@@ -225,6 +247,38 @@ def _metric_rows(payload: Any) -> Iterable[dict[str, Any]]:
                 "fingerprint": _sha256(f"metric:{metric_name}:{fingerprint_basis}"),
                 "payload_json": raw,
             }
+            yield base_row
+
+            if is_sleep_summary:
+                stage_fields = {
+                    "totalSleep": "total_sleep",
+                    "asleep": "asleep",
+                    "awake": "awake",
+                    "core": "core",
+                    "deep": "deep",
+                    "rem": "rem",
+                    "inBed": "in_bed",
+                }
+                for source_key, suffix in stage_fields.items():
+                    stage_value = _number(_first(sample, source_key))
+                    if stage_value is None:
+                        continue
+                    derived_name = f"sleep_analysis.{suffix}"
+                    derived_row = dict(base_row)
+                    derived_row.update(
+                        {
+                            "metric_name": derived_name,
+                            "numeric_value": stage_value,
+                            "min_value": None,
+                            "max_value": None,
+                            "avg_value": None,
+                            "sum_value": None,
+                            "value_text": None,
+                            "sample_uuid": f"{sample_uuid}:{suffix}" if sample_uuid else None,
+                            "fingerprint": _sha256(f"metric:{derived_name}:{fingerprint_basis}"),
+                        }
+                    )
+                    yield derived_row
 
 
 def _category_items(value: Any) -> Iterable[dict[str, Any]]:
@@ -398,6 +452,82 @@ def store_ingestion(
         "ingestion_id": ingestion_id,
         "metric_samples_inserted": metric_count,
         "events_inserted": event_count,
+    }
+
+
+def backfill_metric_normalization(db_path: Path) -> dict[str, int]:
+    """Re-run metric normalization from retained raw payloads without duplicating existing samples."""
+    initialize_database(db_path)
+    with connect(db_path) as connection:
+        before = connection.execute("SELECT COUNT(*) AS count FROM metric_samples").fetchone()["count"]
+        ingestions = connection.execute("SELECT id, raw_json FROM ingestions ORDER BY id").fetchall()
+        payloads_processed = 0
+        for ingestion in ingestions:
+            try:
+                payload = json.loads(ingestion["raw_json"])
+            except json.JSONDecodeError:
+                continue
+            payloads_processed += 1
+            for row in _metric_rows(payload):
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO metric_samples (
+                        ingestion_id, metric_name, unit, start_time, end_time, source,
+                        numeric_value, min_value, max_value, avg_value, sum_value,
+                        value_text, sample_uuid, fingerprint, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        ingestion["id"],
+                        row["metric_name"],
+                        row["unit"],
+                        row["start_time"],
+                        row["end_time"],
+                        row["source"],
+                        row["numeric_value"],
+                        row["min_value"],
+                        row["max_value"],
+                        row["avg_value"],
+                        row["sum_value"],
+                        row["value_text"],
+                        row["sample_uuid"],
+                        row["fingerprint"],
+                        row["payload_json"],
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE metric_samples
+                    SET numeric_value = COALESCE(numeric_value, ?),
+                        start_time = COALESCE(start_time, ?),
+                        end_time = COALESCE(end_time, ?),
+                        unit = COALESCE(unit, ?),
+                        source = COALESCE(source, ?)
+                    WHERE fingerprint = ?
+                    """,
+                    (
+                        row["numeric_value"],
+                        row["start_time"],
+                        row["end_time"],
+                        row["unit"],
+                        row["source"],
+                        row["fingerprint"],
+                    ),
+                )
+        connection.execute(
+            """
+            UPDATE ingestions
+            SET metric_sample_count = (
+                SELECT COUNT(*) FROM metric_samples WHERE ingestion_id = ingestions.id
+            )
+            """
+        )
+        after = connection.execute("SELECT COUNT(*) AS count FROM metric_samples").fetchone()["count"]
+    return {
+        "payloads_processed": payloads_processed,
+        "metric_samples_before": before,
+        "metric_samples_after": after,
+        "metric_samples_added": after - before,
     }
 
 
