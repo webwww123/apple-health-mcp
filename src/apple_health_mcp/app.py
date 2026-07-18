@@ -23,12 +23,15 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from .semantic import (
     DEFAULT_TIMEZONE,
     capabilities,
+    compare_workouts as semantic_compare_workouts,
     get_activity_trend as semantic_get_activity_trend,
     get_daily_activity as semantic_get_daily_activity,
     get_recovery_snapshot as semantic_get_recovery_snapshot,
     get_sleep_summary as semantic_get_sleep_summary,
     get_sleep_trend as semantic_get_sleep_trend,
+    get_workout_detail as semantic_get_workout_detail,
     list_available_data_semantic,
+    list_workouts as semantic_list_workouts,
     localize_fallback_metric_result,
     query_sleep_fallback,
     semantic_health_overview,
@@ -178,6 +181,21 @@ def guide() -> dict[str, Any]:
                 "arguments_example": {"days": 7},
             },
             {
+                "when": "用户问最近做过哪些锻炼、跑步、骑行或健身",
+                "tool": "AppleHealth:list_workouts",
+                "arguments_example": {"days": 7},
+            },
+            {
+                "when": "用户问某一次锻炼的距离、心率、能量、速度或路线是否存在",
+                "tool": "AppleHealth:get_workout_detail",
+                "arguments_example": {"workout_id": "先从AppleHealth:list_workouts取得"},
+            },
+            {
+                "when": "用户问这次锻炼相比上次或个人同类历史表现如何",
+                "tool": "AppleHealth:compare_workouts",
+                "arguments_example": {"workout_id": "先从AppleHealth:list_workouts取得", "baseline_count": 5},
+            },
+            {
                 "when": "用户要求最近7/14/30天的综合健康概览",
                 "tool": "AppleHealth:get_health_overview",
                 "arguments_example": {"days": 7},
@@ -277,6 +295,62 @@ def get_activity_trend(
     previous-equal-period personal baseline. Sparse coverage is explicitly partial/insufficient.
     """
     return semantic_get_activity_trend(get_settings().db_path, days, timezone, output_format, end_date)
+
+
+@mcp.tool(name="list_workouts")
+def list_workouts(
+    days: Literal[7, 14, 30] = 7,
+    timezone: str = DEFAULT_TIMEZONE,
+    output_format: Literal["concise", "detailed"] = "concise",
+    end_date: str | None = None,
+    workout_type: str | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Return compact workout sessions for the latest 7, 14, or 30 local days.
+
+    Use when the user asks which workouts, runs, rides, walks, or gym sessions occurred recently. Results include stable
+    `workout_id` values for follow-up calls, duration, distance, energy, heart rate, speed/pace, per-type counts, period
+    totals, coverage, and a previous-equal-period personal baseline. `workout_type` is an optional exact type returned by
+    this tool. Default concise output never returns route coordinates or raw sensor samples.
+    """
+    return semantic_list_workouts(
+        get_settings().db_path, days, timezone, output_format, end_date, workout_type, limit
+    )
+
+
+@mcp.tool(name="get_workout_detail")
+def get_workout_detail(
+    workout_id: str,
+    timezone: str = DEFAULT_TIMEZONE,
+    output_format: Literal["concise", "detailed"] = "concise",
+) -> dict[str, Any]:
+    """Return one cleaned workout session with a same-type personal-baseline comparison.
+
+    Use after `AppleHealth:list_workouts` when the user asks about one specific workout. `workout_id` must come from that
+    tool. Returns local start/end time, duration, distance, energy, heart-rate range, speed/pace, elevation, sensor
+    coverage, missing fields, and comparison with up to five prior workouts of the same type. Even detailed output is
+    bounded and does not expose route coordinates or full heart-rate samples; use the raw fallback only for debugging.
+    """
+    return semantic_get_workout_detail(get_settings().db_path, workout_id, timezone, output_format)
+
+
+@mcp.tool(name="compare_workouts")
+def compare_workouts(
+    workout_id: str,
+    comparison_workout_id: str | None = None,
+    baseline_count: Literal[3, 5, 10] = 5,
+    timezone: str = DEFAULT_TIMEZONE,
+) -> dict[str, Any]:
+    """Compare one workout with another workout or with the user's recent same-type baseline.
+
+    Use for questions such as "这次骑行比上次怎样" or "这次跑步表现怎样". Obtain IDs from
+    `AppleHealth:list_workouts`. When `comparison_workout_id` is provided, the tool compares those two sessions;
+    otherwise it compares `workout_id` with up to `baseline_count` prior workouts of the same type. Returns mechanical
+    absolute/percentage differences with coverage strength, not a medical or readiness judgment.
+    """
+    return semantic_compare_workouts(
+        get_settings().db_path, workout_id, comparison_workout_id, baseline_count, timezone
+    )
 
 
 @mcp.tool(name="list_available_data")
@@ -543,6 +617,66 @@ async def api_activity_trend(request: Request) -> JSONResponse:
     )
 
 
+async def api_list_workouts(request: Request) -> JSONResponse:
+    query = request.query_params
+    return _semantic_api_response(
+        lambda: semantic_list_workouts(
+            get_settings().db_path,
+            _query_int(query.get("days"), 7),
+            query.get("timezone", DEFAULT_TIMEZONE),
+            query.get("output_format", "concise"),
+            query.get("end_date"),
+            query.get("workout_type"),
+            _query_int(query.get("limit"), 20),
+        )
+    )
+
+
+async def api_workout_detail(request: Request) -> JSONResponse:
+    query = request.query_params
+    workout_id = query.get("workout_id")
+    if not workout_id:
+        return JSONResponse(
+            {
+                "status": "error",
+                "error": "missing_workout_id",
+                "resolution": "Call /api/v1/health/workouts first, then provide workout_id.",
+            },
+            status_code=400,
+        )
+    return _semantic_api_response(
+        lambda: semantic_get_workout_detail(
+            get_settings().db_path,
+            workout_id,
+            query.get("timezone", DEFAULT_TIMEZONE),
+            query.get("output_format", "concise"),
+        )
+    )
+
+
+async def api_compare_workouts(request: Request) -> JSONResponse:
+    query = request.query_params
+    workout_id = query.get("workout_id")
+    if not workout_id:
+        return JSONResponse(
+            {
+                "status": "error",
+                "error": "missing_workout_id",
+                "resolution": "Call /api/v1/health/workouts first, then provide workout_id.",
+            },
+            status_code=400,
+        )
+    return _semantic_api_response(
+        lambda: semantic_compare_workouts(
+            get_settings().db_path,
+            workout_id,
+            query.get("comparison_workout_id"),
+            _query_int(query.get("baseline_count"), 5),
+            query.get("timezone", DEFAULT_TIMEZONE),
+        )
+    )
+
+
 async def api_health_overview(request: Request) -> JSONResponse:
     query = request.query_params
     return _semantic_api_response(
@@ -649,6 +783,9 @@ core_app = Starlette(
         Route("/api/v1/health/recovery/snapshot", api_recovery_snapshot, methods=["GET"]),
         Route("/api/v1/health/activity/daily", api_daily_activity, methods=["GET"]),
         Route("/api/v1/health/activity/trend", api_activity_trend, methods=["GET"]),
+        Route("/api/v1/health/workouts", api_list_workouts, methods=["GET"]),
+        Route("/api/v1/health/workouts/detail", api_workout_detail, methods=["GET"]),
+        Route("/api/v1/health/workouts/compare", api_compare_workouts, methods=["GET"]),
         Route("/api/v1/health/overview", api_health_overview, methods=["GET"]),
         Mount("/", app=mcp_http_app),
     ],

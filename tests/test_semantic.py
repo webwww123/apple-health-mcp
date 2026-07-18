@@ -2,11 +2,14 @@ import json
 from pathlib import Path
 
 from apple_health_mcp.semantic import (
+    compare_workouts,
     get_activity_trend,
     get_daily_activity,
     get_recovery_snapshot,
     get_sleep_summary,
     get_sleep_trend,
+    get_workout_detail,
+    list_workouts,
     query_sleep_fallback,
     semantic_health_overview,
 )
@@ -160,7 +163,37 @@ def _seed_semantic_data(db_path: Path) -> None:
                         {"source": "Apple Watch", "date": "2026-07-18 10:00:00 +0800", "qty": 40},
                     ],
                 },
-            ]
+            ],
+            "workouts": [
+                {
+                    "id": f"ride-{day}",
+                    "name": "户外 骑行",
+                    "start": f"2026-07-{day:02d} 18:00:00 +0800",
+                    "end": f"2026-07-{day:02d} 18:{10 + day:02d}:00 +0800",
+                    "duration": (10 + day) * 60,
+                    "distance": {"qty": 2.0 + day / 10, "units": "km"},
+                    "activeEnergyBurned": {"qty": 210 + day, "units": "kJ"},
+                    "heartRate": {
+                        "avg": {"qty": 100 + day, "units": "count/min"},
+                        "min": {"qty": 85 + day, "units": "count/min"},
+                        "max": {"qty": 125 + day, "units": "count/min"},
+                    },
+                    "speed": {"qty": 8 + day / 10, "units": "km/hr"},
+                    "maxSpeed": {"qty": 16 + day / 10, "units": "km"},
+                    "elevationUp": {"qty": 10 + day, "units": "m"},
+                    "isIndoor": False,
+                    "location": "户外",
+                    "heartRateData": [
+                        {
+                            "Avg": 100 + day,
+                            "source": "Apple Watch",
+                            "date": f"2026-07-{day:02d} 18:05:00 +0800",
+                        }
+                    ],
+                    "route": [{"latitude": 0, "longitude": 0}],
+                }
+                for day in (15, 16, 17, 18)
+            ],
         }
     }
     raw = json.dumps(payload)
@@ -261,3 +294,33 @@ def test_recovery_activity_and_overview_contracts(tmp_path: Path) -> None:
     assert "total" not in overview["summary"]["cardiovascular"]["heart_rate"]
     assert "total" not in overview["summary"]["cardiovascular"]["heart_rate_variability"]
     assert "total" not in overview["summary"]["respiratory"]["blood_oxygen_saturation"]
+
+
+def test_workout_semantic_contracts(tmp_path: Path) -> None:
+    db_path = tmp_path / "health.db"
+    _seed_semantic_data(db_path)
+
+    listed = list_workouts(db_path, days=7, end_date="2026-07-18")
+    assert listed["status"] == "ok"
+    assert listed["summary"]["workout_count"] == 4
+    assert listed["summary"]["by_type"] == [{"type": "户外 骑行", "count": 4}]
+    assert listed["data_quality"]["missing_days"] is None
+    latest = listed["summary"]["workouts"][0]
+    assert latest["workout_id"] == "ride-18"
+    assert "route" not in json.dumps(latest)
+
+    detail = get_workout_detail(db_path, "ride-18", output_format="detailed")
+    assert detail["status"] == "ok"
+    assert detail["summary"]["workout"]["sensor_coverage"]["route_points"] == 1
+    assert detail["summary"]["workout"]["active_energy_kcal"] == 54.5
+    assert detail["comparison_to_personal_baseline"]["baseline_workouts"] == 3
+    assert "latitude" not in json.dumps(detail)
+
+    compared = compare_workouts(db_path, "ride-18")
+    assert compared["status"] == "ok"
+    assert compared["comparison_to_personal_baseline"]["baseline_workouts"] == 3
+    assert compared["summary"]["metric_comparison"]["distance_km"]["difference"] == 0.2
+
+    missing = get_workout_detail(db_path, "not-found")
+    assert missing["status"] == "empty"
+    assert "AppleHealth:list_workouts" in missing["highlights"][0]

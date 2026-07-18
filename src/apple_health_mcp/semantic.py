@@ -117,12 +117,18 @@ def _latest_ingestion(db_path: Path, zone: ZoneInfo) -> str | None:
 
 def capabilities(db_path: Path | None = None) -> dict[str, bool]:
     has_workouts = False
+    has_cycle_tracking = False
     if db_path is not None:
         initialize_database(db_path)
         with connect(db_path) as connection:
             has_workouts = bool(
                 connection.execute(
                     "SELECT 1 FROM health_events WHERE category COLLATE NOCASE = 'workouts' LIMIT 1"
+                ).fetchone()
+            )
+            has_cycle_tracking = bool(
+                connection.execute(
+                    "SELECT 1 FROM health_events WHERE category COLLATE NOCASE = 'cycleTracking' LIMIT 1"
                 ).fetchone()
             )
     return {
@@ -135,6 +141,9 @@ def capabilities(db_path: Path | None = None) -> dict[str, bool]:
         "daily_activity_summary": True,
         "personal_baseline_comparison": True,
         "workout_session_summary": has_workouts,
+        "workout_detail_summary": has_workouts,
+        "workout_comparison": has_workouts,
+        "cycle_tracking_events": has_cycle_tracking,
         "subjective_context_logging": False,
     }
 
@@ -639,35 +648,578 @@ def _activity_day_values(db_path: Path, day: Date, zone: ZoneInfo) -> dict[str, 
     }
 
 
-def _workouts_for_day(db_path: Path, day: Date, zone: ZoneInfo) -> list[dict[str, Any]]:
-    start, end = _day_bounds(day, zone)
+def _quantity(payload: dict[str, Any], *keys: str) -> tuple[float | None, str | None]:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, dict):
+            quantity = _number(value.get("qty"))
+            unit = value.get("units")
+            return quantity, str(unit) if unit is not None else None
+    return None, None
+
+
+def _energy_kcal(quantity: float | None, unit: str | None) -> float | None:
+    if quantity is None:
+        return None
+    normalized = (unit or "").strip().lower()
+    if normalized == "kj":
+        return quantity / 4.184
+    if normalized == "j":
+        return quantity / 4184
+    if normalized in {"kcal", "calorie", "calories"}:
+        return quantity
+    return None
+
+
+def _distance_km(quantity: float | None, unit: str | None) -> float | None:
+    if quantity is None:
+        return None
+    normalized = (unit or "").strip().lower()
+    if normalized in {"km", "kilometer", "kilometers"}:
+        return quantity
+    if normalized in {"m", "meter", "meters"}:
+        return quantity / 1000
+    if normalized in {"mi", "mile", "miles"}:
+        return quantity * 1.609344
+    return None
+
+
+def _speed_kmh(quantity: float | None, unit: str | None) -> float | None:
+    if quantity is None:
+        return None
+    normalized = (unit or "").strip().lower()
+    if normalized in {"km/hr", "km/h", "kph"}:
+        return quantity
+    if normalized in {"m/s", "m/sec"}:
+        return quantity * 3.6
+    if normalized in {"mi/hr", "mph"}:
+        return quantity * 1.609344
+    return None
+
+
+def _workout_rows(
+    db_path: Path,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    workout_id: str | None = None,
+) -> list[dict[str, Any]]:
     initialize_database(db_path)
+    clauses = ["he.category COLLATE NOCASE = 'workouts'"]
+    params: list[Any] = []
+    if start is not None:
+        clauses.append("he.start_time >= ?")
+        params.append(_utc_iso(start))
+    if end is not None:
+        clauses.append("he.start_time < ?")
+        params.append(_utc_iso(end))
+    if workout_id is not None:
+        clauses.append(
+            "(he.event_uuid = ? OR json_extract(he.payload_json, '$.id') = ? "
+            "OR json_extract(he.payload_json, '$.uuid') = ?)"
+        )
+        params.extend([workout_id, workout_id, workout_id])
     with connect(db_path) as connection:
         rows = connection.execute(
-            """
-            SELECT he.event_type, he.start_time, he.end_time, he.source, he.payload_json
+            f"""
+            SELECT he.event_uuid, he.event_type, he.start_time, he.end_time, he.source,
+                   he.payload_json, i.received_at
             FROM health_events he
-            WHERE he.category COLLATE NOCASE = 'workouts'
-              AND he.start_time >= ? AND he.start_time < ?
-            ORDER BY he.start_time
+            JOIN ingestions i ON i.id = he.ingestion_id
+            WHERE {' AND '.join(clauses)}
+            ORDER BY he.start_time DESC
             """,
-            (_utc_iso(start), _utc_iso(end)),
+            params,
         ).fetchall()
-    workouts: list[dict[str, Any]] = []
-    for row in rows:
-        start_dt = _parse_datetime(row["start_time"])
-        end_dt = _parse_datetime(row["end_time"])
-        duration = round((end_dt - start_dt).total_seconds() / 60) if start_dt and end_dt else None
-        workouts.append(
-            {
-                "type": row["event_type"],
-                "start": _local_iso(start_dt, zone),
-                "end": _local_iso(end_dt, zone),
-                "duration_minutes": duration,
-                "source": row["source"],
-            }
+    return [dict(row) for row in rows]
+
+
+def _workout_summary(row: dict[str, Any], zone: ZoneInfo, detailed: bool = False) -> dict[str, Any]:
+    payload = json.loads(row["payload_json"])
+    start = _parse_datetime(row.get("start_time"))
+    end = _parse_datetime(row.get("end_time"))
+    duration_seconds = _number(payload.get("duration"))
+    if duration_seconds is None and start is not None and end is not None:
+        duration_seconds = max(0.0, (end - start).total_seconds())
+
+    distance_quantity, distance_unit = _quantity(payload, "distance")
+    active_quantity, active_unit = _quantity(payload, "activeEnergyBurned")
+    total_quantity, total_unit = _quantity(payload, "totalEnergy")
+    average_hr, _ = _quantity(payload, "avgHeartRate")
+    minimum_hr = None
+    maximum_hr, _ = _quantity(payload, "maxHeartRate")
+    heart_rate = payload.get("heartRate")
+    if isinstance(heart_rate, dict):
+        if isinstance(heart_rate.get("avg"), dict):
+            average_hr = _number(heart_rate["avg"].get("qty")) or average_hr
+        if isinstance(heart_rate.get("min"), dict):
+            minimum_hr = _number(heart_rate["min"].get("qty"))
+        if isinstance(heart_rate.get("max"), dict):
+            maximum_hr = _number(heart_rate["max"].get("qty")) or maximum_hr
+
+    average_speed_quantity, average_speed_unit = _quantity(payload, "speed", "avgSpeed")
+    max_speed_quantity, max_speed_unit = _quantity(payload, "maxSpeed")
+    elevation_quantity, elevation_unit = _quantity(payload, "elevationUp")
+    distance_km = _distance_km(distance_quantity, distance_unit)
+    duration_minutes = duration_seconds / 60 if duration_seconds is not None else None
+    average_speed_kmh = _speed_kmh(average_speed_quantity, average_speed_unit)
+    derived_fields: list[str] = []
+    quality_flags: list[str] = []
+    if average_speed_kmh is None and distance_km is not None and duration_seconds:
+        average_speed_kmh = distance_km / (duration_seconds / 3600)
+        derived_fields.append("average_speed_kmh")
+    max_speed_kmh = _speed_kmh(max_speed_quantity, max_speed_unit)
+    if max_speed_kmh is None and max_speed_quantity is not None and (max_speed_unit or "").lower() == "km":
+        max_speed_kmh = max_speed_quantity
+        quality_flags.append("max_speed_unit_normalized_from_export_field")
+
+    activity_name = str(row.get("event_type") or payload.get("name") or "未知锻炼")
+    normalized_name = activity_name.casefold()
+    pace_minutes_per_km = None
+    if distance_km and duration_minutes is not None and any(
+        marker in normalized_name for marker in ("步行", "跑", "walk", "run")
+    ):
+        pace_minutes_per_km = duration_minutes / distance_km
+        derived_fields.append("pace_minutes_per_km")
+
+    heart_rate_samples = payload.get("heartRateData")
+    route = payload.get("route")
+    recovery = payload.get("heartRateRecovery")
+    source = row.get("source") or payload.get("source")
+    if not source and isinstance(heart_rate_samples, list) and heart_rate_samples:
+        first_sample = heart_rate_samples[0]
+        if isinstance(first_sample, dict):
+            source = first_sample.get("source")
+
+    missing_fields = [
+        field
+        for field, value in (
+            ("workout_id", row.get("event_uuid") or payload.get("id") or payload.get("uuid")),
+            ("start", start),
+            ("end", end),
+            ("duration_minutes", duration_minutes),
         )
-    return workouts
+        if value is None
+    ]
+    workout = {
+        "workout_id": row.get("event_uuid") or payload.get("id") or payload.get("uuid"),
+        "type": activity_name,
+        "start": _local_iso(start, zone),
+        "end": _local_iso(end, zone),
+        "duration_minutes": _round(duration_minutes, 1),
+        "is_indoor": payload.get("isIndoor"),
+        "location": payload.get("location"),
+        "distance_km": _round(distance_km, 3),
+        "active_energy_kcal": _round(_energy_kcal(active_quantity, active_unit), 1),
+        "total_energy_kcal": _round(_energy_kcal(total_quantity, total_unit), 1),
+        "heart_rate_bpm": {
+            "average": _round(average_hr, 1),
+            "minimum": _round(minimum_hr, 1),
+            "maximum": _round(maximum_hr, 1),
+        },
+        "average_speed_kmh": _round(average_speed_kmh, 2),
+        "max_speed_kmh": _round(max_speed_kmh, 2),
+        "pace_minutes_per_km": _round(pace_minutes_per_km, 2),
+        "elevation_gain_m": (
+            _round(elevation_quantity, 1)
+            if elevation_quantity is not None and (elevation_unit or "").lower() == "m"
+            else None
+        ),
+        "sensor_coverage": {
+            "heart_rate_samples": len(heart_rate_samples) if isinstance(heart_rate_samples, list) else 0,
+            "heart_rate_recovery_samples": len(recovery) if isinstance(recovery, list) else 0,
+            "route_available": bool(route) if isinstance(route, list) else False,
+            "route_points": len(route) if isinstance(route, list) else 0,
+        },
+        "source": source,
+    }
+    if detailed:
+        workout["reported_units"] = {
+            "distance": distance_unit,
+            "active_energy": active_unit,
+            "total_energy": total_unit,
+            "average_speed": average_speed_unit,
+            "max_speed": max_speed_unit,
+            "elevation_gain": elevation_unit,
+        }
+        workout["recorded_metrics"] = [
+            name
+            for name, value in (
+                ("duration", duration_minutes),
+                ("distance", distance_km),
+                ("active_energy", _energy_kcal(active_quantity, active_unit)),
+                ("heart_rate", average_hr),
+                ("speed", average_speed_kmh),
+                ("elevation_gain", elevation_quantity),
+                ("route", route if isinstance(route, list) and route else None),
+            )
+            if value is not None
+        ]
+    workout["_quality"] = {
+        "complete": not missing_fields,
+        "missing_fields": missing_fields,
+        "derived_fields": derived_fields,
+        "quality_flags": quality_flags,
+    }
+    return workout
+
+
+def _compact_workout(workout: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: workout.get(key)
+        for key in (
+            "workout_id",
+            "type",
+            "start",
+            "duration_minutes",
+            "distance_km",
+            "active_energy_kcal",
+            "heart_rate_bpm",
+            "average_speed_kmh",
+            "pace_minutes_per_km",
+            "is_indoor",
+        )
+    }
+
+
+def _workout_averages(workouts: list[dict[str, Any]]) -> dict[str, float | None]:
+    return {
+        "duration_minutes": _round(_mean([_number(item.get("duration_minutes")) for item in workouts]), 1),
+        "distance_km": _round(_mean([_number(item.get("distance_km")) for item in workouts]), 3),
+        "active_energy_kcal": _round(
+            _mean([_number(item.get("active_energy_kcal")) for item in workouts]), 1
+        ),
+        "average_heart_rate_bpm": _round(
+            _mean([_number(item.get("heart_rate_bpm", {}).get("average")) for item in workouts]), 1
+        ),
+        "average_speed_kmh": _round(_mean([_number(item.get("average_speed_kmh")) for item in workouts]), 2),
+        "pace_minutes_per_km": _round(
+            _mean([_number(item.get("pace_minutes_per_km")) for item in workouts]), 2
+        ),
+        "elevation_gain_m": _round(_mean([_number(item.get("elevation_gain_m")) for item in workouts]), 1),
+    }
+
+
+def _metric_differences(target: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]:
+    target_values = {
+        "duration_minutes": _number(target.get("duration_minutes")),
+        "distance_km": _number(target.get("distance_km")),
+        "active_energy_kcal": _number(target.get("active_energy_kcal")),
+        "average_heart_rate_bpm": _number(target.get("heart_rate_bpm", {}).get("average")),
+        "average_speed_kmh": _number(target.get("average_speed_kmh")),
+        "pace_minutes_per_km": _number(target.get("pace_minutes_per_km")),
+        "elevation_gain_m": _number(target.get("elevation_gain_m")),
+    }
+    result: dict[str, Any] = {}
+    for metric, target_value in target_values.items():
+        baseline_value = _number(baseline.get(metric))
+        difference = target_value - baseline_value if target_value is not None and baseline_value is not None else None
+        result[metric] = {
+            "target": _round(target_value, 2),
+            "baseline": _round(baseline_value, 2),
+            "difference": _round(difference, 2),
+            "difference_percent": (
+                _round(difference / baseline_value * 100, 1)
+                if difference is not None and baseline_value not in {None, 0}
+                else None
+            ),
+        }
+    return result
+
+
+def _workout_highlights(workout: dict[str, Any], baseline_count: int | None = None) -> list[str]:
+    highlights: list[str] = []
+    duration = _number(workout.get("duration_minutes"))
+    distance = _number(workout.get("distance_km"))
+    if duration is not None:
+        text = f"{workout.get('type')}约{round(duration)}分钟"
+        if distance is not None:
+            text += f"，{distance:.2f}公里"
+        highlights.append(text)
+    average_hr = _number(workout.get("heart_rate_bpm", {}).get("average"))
+    energy = _number(workout.get("active_energy_kcal"))
+    if average_hr is not None or energy is not None:
+        parts = []
+        if average_hr is not None:
+            parts.append(f"平均心率约{round(average_hr)}次/分")
+        if energy is not None:
+            parts.append(f"活动能量约{round(energy)}千卡")
+        highlights.append("，".join(parts))
+    if baseline_count is not None and baseline_count < 3:
+        highlights.append(f"仅有{baseline_count}次同类历史锻炼可比较，个人基线仍不足")
+    return highlights[:3]
+
+
+def list_workouts(
+    db_path: Path,
+    days: int = 7,
+    timezone: str = DEFAULT_TIMEZONE,
+    output_format: Literal["concise", "detailed"] = "concise",
+    end_date: str | None = None,
+    workout_type: str | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    _validate_output_format(output_format)
+    if days not in {7, 14, 30}:
+        raise ValueError("days must be one of 7, 14, or 30")
+    if not 1 <= limit <= 50:
+        raise ValueError("limit must be between 1 and 50")
+    zone = _zone(timezone)
+    end_day = _parse_date(end_date) if end_date else datetime.now(zone).date()
+    start_day = end_day - timedelta(days=days - 1)
+    start, _ = _day_bounds(start_day, zone)
+    _, end = _day_bounds(end_day, zone)
+    workouts = [
+        _workout_summary(row, zone, output_format == "detailed")
+        for row in _workout_rows(db_path, start, end)
+    ]
+    if workout_type:
+        workouts = [item for item in workouts if str(item.get("type", "")).casefold() == workout_type.casefold()]
+    matching_workout_count = len(workouts)
+    workouts = workouts[:limit]
+    truncated = matching_workout_count > len(workouts)
+
+    previous_start = start - timedelta(days=days)
+    previous = [_workout_summary(row, zone) for row in _workout_rows(db_path, previous_start, start)]
+    if workout_type:
+        previous = [item for item in previous if str(item.get("type", "")).casefold() == workout_type.casefold()]
+    current_averages = _workout_averages(workouts)
+    previous_averages = _workout_averages(previous)
+    sources = sorted({str(item["source"]) for item in workouts if item.get("source")})
+    quality = [item.pop("_quality") for item in workouts]
+    complete = bool(workouts) and all(item["complete"] for item in quality) and not truncated
+    workout_dates = sorted({str(item["start"])[:10] for item in workouts if item.get("start")})
+    by_type: dict[str, int] = {}
+    for item in workouts:
+        name = str(item.get("type") or "未知锻炼")
+        by_type[name] = by_type.get(name, 0) + 1
+    summary = {
+        "workout_count": len(workouts),
+        "workout_days": len(workout_dates),
+        "totals": {
+            "duration_minutes": _round(_sum_optional([_number(item.get("duration_minutes")) for item in workouts]), 1),
+            "distance_km": _round(_sum_optional([_number(item.get("distance_km")) for item in workouts]), 3),
+            "active_energy_kcal": _round(
+                _sum_optional([_number(item.get("active_energy_kcal")) for item in workouts]), 1
+            ),
+        },
+        "by_type": [{"type": name, "count": count} for name, count in sorted(by_type.items())],
+        "workouts": workouts if output_format == "detailed" else [_compact_workout(item) for item in workouts],
+    }
+    status = "empty" if not workouts else "ok" if complete else "partial"
+    highlights = (
+        [f"请求范围内找到{matching_workout_count}次锻炼，当前返回{len(workouts)}次，覆盖{len(workout_dates)}天"]
+        if workouts
+        else ["请求范围内没有已上传的锻炼"]
+    )
+    if by_type:
+        highlights.append("锻炼类型：" + "、".join(f"{name}{count}次" for name, count in by_type.items()))
+    return {
+        "status": status,
+        "timezone": zone.key,
+        "requested_range": {
+            "start_date": start_day.isoformat(),
+            "end_date": end_day.isoformat(),
+            "days": days,
+            "workout_type": workout_type,
+            "limit": limit,
+        },
+        "actual_data_range": (
+            {"start": workouts[-1]["start"], "end": workouts[0].get("end") or workouts[0]["start"]}
+            if workouts
+            else None
+        ),
+        "summary": summary,
+        "comparison_to_personal_baseline": {
+            "baseline_window": "previous_equal_length_period",
+            "baseline_workouts": len(previous),
+            "current_average": current_averages,
+            "baseline_average": previous_averages,
+            "strength": _strength(len(previous)),
+        },
+        "highlights": highlights[:3],
+        "fetch": {"complete": complete},
+        "data_quality": {
+            "complete": complete,
+            "valid_days": len(workout_dates),
+            "missing_days": None,
+            "latest_ingestion": _latest_ingestion(db_path, zone),
+            "sources": sources,
+            "derived_fields": sorted({field for item in quality for field in item["derived_fields"]}),
+            "missing_fields": sorted({field for item in quality for field in item["missing_fields"]}),
+            "quality_flags": sorted({flag for item in quality for flag in item["quality_flags"]}),
+            "coverage_note": "没有锻炼的日期不等于缺失数据，因此missing_days为null。",
+            "truncated": truncated,
+        },
+    }
+
+
+def get_workout_detail(
+    db_path: Path,
+    workout_id: str,
+    timezone: str = DEFAULT_TIMEZONE,
+    output_format: Literal["concise", "detailed"] = "concise",
+) -> dict[str, Any]:
+    _validate_output_format(output_format)
+    if not workout_id.strip():
+        raise ValueError("workout_id must not be empty; call list_workouts to obtain one")
+    zone = _zone(timezone)
+    rows = _workout_rows(db_path, workout_id=workout_id)
+    if not rows:
+        return {
+            "status": "empty",
+            "timezone": zone.key,
+            "requested_range": {"workout_id": workout_id},
+            "actual_data_range": None,
+            "summary": {},
+            "comparison_to_personal_baseline": {"baseline_workouts": 0, "strength": "insufficient_data"},
+            "highlights": ["未找到该workout_id；请先调用AppleHealth:list_workouts获取有效ID"],
+            "fetch": {"complete": False},
+            "data_quality": {
+                "complete": False,
+                "valid_days": 0,
+                "missing_days": None,
+                "latest_ingestion": _latest_ingestion(db_path, zone),
+                "sources": [],
+                "derived_fields": [],
+                "missing_fields": ["workout_id"],
+            },
+        }
+    workout = _workout_summary(rows[0], zone, output_format == "detailed")
+    quality = workout.pop("_quality")
+    target_start = _parse_datetime(rows[0].get("start_time"))
+    prior_rows = _workout_rows(db_path, end=target_start) if target_start else []
+    prior = [
+        _workout_summary(row, zone)
+        for row in prior_rows
+        if str(row.get("event_type", "")).casefold() == str(workout.get("type", "")).casefold()
+    ][:5]
+    for item in prior:
+        item.pop("_quality", None)
+    baseline = _workout_averages(prior)
+    complete = quality["complete"]
+    return {
+        "status": "ok" if complete else "partial",
+        "timezone": zone.key,
+        "requested_range": {"workout_id": workout_id},
+        "actual_data_range": {"start": workout["start"], "end": workout["end"]},
+        "summary": {"workout": workout},
+        "comparison_to_personal_baseline": {
+            "baseline_type": "previous_same_type_workouts",
+            "baseline_workouts": len(prior),
+            "baseline_average": baseline,
+            "metric_comparison": _metric_differences(workout, baseline),
+            "strength": _strength(len(prior)),
+        },
+        "highlights": _workout_highlights(workout, len(prior)),
+        "fetch": {"complete": complete},
+        "data_quality": {
+            "complete": complete,
+            "valid_days": 1,
+            "missing_days": 0,
+            "latest_ingestion": _latest_ingestion(db_path, zone),
+            "sources": [workout["source"]] if workout.get("source") else [],
+            "derived_fields": quality["derived_fields"],
+            "missing_fields": quality["missing_fields"],
+            "quality_flags": quality["quality_flags"],
+            "raw_samples_returned": False,
+        },
+    }
+
+
+def compare_workouts(
+    db_path: Path,
+    workout_id: str,
+    comparison_workout_id: str | None = None,
+    baseline_count: int = 5,
+    timezone: str = DEFAULT_TIMEZONE,
+) -> dict[str, Any]:
+    if baseline_count not in {3, 5, 10}:
+        raise ValueError("baseline_count must be one of 3, 5, or 10")
+    zone = _zone(timezone)
+    rows = _workout_rows(db_path, workout_id=workout_id)
+    if not rows:
+        return get_workout_detail(db_path, workout_id, timezone)
+    target = _workout_summary(rows[0], zone)
+    target_quality = target.pop("_quality")
+
+    comparison_type = "specific_workout" if comparison_workout_id else "previous_same_type_workouts"
+    comparison_workouts: list[dict[str, Any]] = []
+    if comparison_workout_id:
+        comparison_rows = _workout_rows(db_path, workout_id=comparison_workout_id)
+        if not comparison_rows:
+            raise ValueError(
+                "comparison_workout_id was not found; call list_workouts to obtain a valid workout ID"
+            )
+        comparison_workouts = [_workout_summary(comparison_rows[0], zone)]
+    else:
+        target_start = _parse_datetime(rows[0].get("start_time"))
+        prior_rows = _workout_rows(db_path, end=target_start) if target_start else []
+        comparison_workouts = [
+            _workout_summary(row, zone)
+            for row in prior_rows
+            if str(row.get("event_type", "")).casefold() == str(target.get("type", "")).casefold()
+        ][:baseline_count]
+    comparison_quality = [item.pop("_quality") for item in comparison_workouts]
+    baseline = _workout_averages(comparison_workouts)
+    complete = target_quality["complete"] and all(item["complete"] for item in comparison_quality)
+    enough_baseline = bool(comparison_workouts) and (comparison_workout_id is not None or len(comparison_workouts) >= 3)
+    status = "ok" if complete and enough_baseline else "partial"
+    highlights = _workout_highlights(target, None if comparison_workout_id else len(comparison_workouts))
+    if comparison_workout_id:
+        highlights.append("已与指定的另一场锻炼进行机械指标比较")
+    elif comparison_workouts:
+        highlights.append(f"已与此前{len(comparison_workouts)}次同类锻炼的个人均值比较")
+    else:
+        highlights.append("没有更早的同类锻炼可用于比较")
+    actual_starts = [item.get("start") for item in [target, *comparison_workouts] if item.get("start")]
+    quality_items = [target_quality, *comparison_quality]
+    return {
+        "status": status,
+        "timezone": zone.key,
+        "requested_range": {
+            "workout_id": workout_id,
+            "comparison_workout_id": comparison_workout_id,
+            "baseline_count": baseline_count,
+        },
+        "actual_data_range": (
+            {"start": min(actual_starts), "end": max(actual_starts)} if actual_starts else None
+        ),
+        "summary": {
+            "target_workout": _compact_workout(target),
+            "comparison_type": comparison_type,
+            "comparison_workouts": [_compact_workout(item) for item in comparison_workouts],
+            "metric_comparison": _metric_differences(target, baseline),
+        },
+        "comparison_to_personal_baseline": {
+            "baseline_type": comparison_type,
+            "baseline_workouts": len(comparison_workouts),
+            "baseline_average": baseline,
+            "strength": "direct" if comparison_workout_id else _strength(len(comparison_workouts)),
+        },
+        "highlights": highlights[:3],
+        "fetch": {"complete": complete},
+        "data_quality": {
+            "complete": complete,
+            "valid_days": len({value[:10] for value in actual_starts}),
+            "missing_days": None,
+            "latest_ingestion": _latest_ingestion(db_path, zone),
+            "sources": sorted(
+                {str(item["source"]) for item in [target, *comparison_workouts] if item.get("source")}
+            ),
+            "derived_fields": sorted({field for item in quality_items for field in item["derived_fields"]}),
+            "missing_fields": sorted({field for item in quality_items for field in item["missing_fields"]}),
+            "quality_flags": sorted({flag for item in quality_items for flag in item["quality_flags"]}),
+            "raw_samples_returned": False,
+        },
+    }
+
+
+def _workouts_for_day(db_path: Path, day: Date, zone: ZoneInfo) -> list[dict[str, Any]]:
+    start, end = _day_bounds(day, zone)
+    workouts = [_workout_summary(row, zone) for row in reversed(_workout_rows(db_path, start, end))]
+    for workout in workouts:
+        workout.pop("_quality", None)
+    return [_compact_workout(workout) for workout in workouts]
 
 
 def _activity_baseline(

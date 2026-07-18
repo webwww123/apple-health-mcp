@@ -94,6 +94,9 @@ def test_ingest_auth_and_health(tmp_path, monkeypatch) -> None:
             "get_recovery_snapshot",
             "get_daily_activity",
             "get_activity_trend",
+            "list_workouts",
+            "get_workout_detail",
+            "compare_workouts",
             "list_available_data",
             "query_health_metrics",
             "query_health_events",
@@ -127,6 +130,8 @@ def test_ingest_auth_and_health(tmp_path, monkeypatch) -> None:
         assert guided.json()["result"]["isError"] is False
         guide_text = json.dumps(guided.json(), ensure_ascii=False)
         assert "AppleHealth:get_sleep_summary" in guide_text
+        assert "AppleHealth:list_workouts" in guide_text
+        assert "AppleHealth:compare_workouts" in guide_text
         assert "AppleHealth:get_health_overview" in guide_text
 
         sleep = client.post(
@@ -156,3 +161,16 @@ def test_ingest_auth_and_health(tmp_path, monkeypatch) -> None:
         )
         assert api_sleep.status_code == 200
         assert api_sleep.json()["status"] == "empty"
+
+        api_workouts = client.get(
+            "/api/v1/health/workouts?days=7&end_date=2026-07-18",
+            headers=api_headers,
+        )
+        assert api_workouts.status_code == 200
+        assert api_workouts.json()["status"] == "empty"
+
+        missing_workout_id = client.get(
+            "/api/v1/health/workouts/detail",
+            headers=api_headers,
+        )
+        assert missing_workout_id.status_code == 400

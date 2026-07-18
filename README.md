@@ -46,7 +46,7 @@ Retrieve the separate MCP token directly on the server with:
 sudo cat /etc/apple-health-mcp/mcp-token
 ```
 
-The server exposes ten read-only tools.
+The server exposes thirteen read-only tools.
 
 Primary scene tools:
 
@@ -56,6 +56,9 @@ Primary scene tools:
 - `AppleHealth:get_recovery_snapshot`
 - `AppleHealth:get_daily_activity`
 - `AppleHealth:get_activity_trend`
+- `AppleHealth:list_workouts`
+- `AppleHealth:get_workout_detail`
+- `AppleHealth:compare_workouts`
 - `AppleHealth:get_health_overview`
 
 Fallback/debug tools:
@@ -81,7 +84,14 @@ Authorization: Bearer <MCP_TOKEN>
 - `GET /apple-health/api/v1/health/recovery/snapshot?date=2026-07-18`
 - `GET /apple-health/api/v1/health/activity/daily?date=2026-07-18`
 - `GET /apple-health/api/v1/health/activity/trend?days=7`
+- `GET /apple-health/api/v1/health/workouts?days=7`
+- `GET /apple-health/api/v1/health/workouts/detail?workout_id=<WORKOUT_ID>`
+- `GET /apple-health/api/v1/health/workouts/compare?workout_id=<WORKOUT_ID>&baseline_count=5`
 - `GET /apple-health/api/v1/health/overview?days=7`
+
+Workout scene APIs return compact session summaries and sensor coverage without exposing full route coordinates or raw
+heart-rate samples. Cycle-tracking events are detected in capabilities and remain available through the raw-event
+fallback until a dedicated conversational scene contract is defined.
 
 For lossless debugging, call `AppleHealth:query_health_metrics` with `aggregation="raw"` and
 `output_format="detailed"`. The response then includes the complete original exported sample alongside normalized
