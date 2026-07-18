@@ -88,6 +88,7 @@ def test_ingest_auth_and_health(tmp_path, monkeypatch) -> None:
         )
         assert tools.status_code == 200
         assert {tool["name"] for tool in tools.json()["result"]["tools"]} == {
+            "guide",
             "list_available_data",
             "query_health_metrics",
             "query_health_events",
@@ -106,3 +107,19 @@ def test_ingest_auth_and_health(tmp_path, monkeypatch) -> None:
         )
         assert called.status_code == 200
         assert called.json()["result"]["isError"] is False
+
+        guided = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {"name": "guide", "arguments": {}},
+            },
+            headers=mcp_headers,
+        )
+        assert guided.status_code == 200
+        assert guided.json()["result"]["isError"] is False
+        guide_text = json.dumps(guided.json(), ensure_ascii=False)
+        assert "AppleHealth:get_health_overview" in guide_text
+        assert "AppleHealth:query_health_metrics" in guide_text

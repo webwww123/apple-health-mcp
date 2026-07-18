@@ -40,8 +40,9 @@ Retrieve the separate MCP token directly on the server with:
 sudo cat /etc/apple-health-mcp/mcp-token
 ```
 
-The server exposes four read-only tools:
+The server exposes five read-only tools:
 
+- `AppleHealth:guide`
 - `AppleHealth:list_available_data`
 - `AppleHealth:query_health_metrics`
 - `AppleHealth:query_health_events`

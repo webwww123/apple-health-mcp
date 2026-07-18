@@ -98,9 +98,10 @@ class MCPBearerAuthMiddleware:
 mcp = FastMCP(
     name="AppleHealth",
     instructions=(
-        "Read-only access to the owner's Apple Health exports. Use list_available_data before querying unknown "
-        "metric or event names. Treat results as personal health records, minimize disclosure, and never present "
-        "them as medical diagnosis. Aggregates are mechanical summaries of exported samples."
+        "Read-only access to the owner's Apple Health exports. 当用户询问如何使用、有哪些功能或工具选择不明确时，"
+        "先调用 guide，并立即按其建议继续调用数据工具。Use list_available_data before querying unknown metric or "
+        "event names. Treat results as personal health records, minimize disclosure, and never present them as medical "
+        "diagnosis. Aggregates are mechanical summaries of exported samples."
     ),
     stateless_http=True,
     json_response=True,
@@ -119,6 +120,75 @@ mcp = FastMCP(
         allowed_origins=["https://apps.supxh.xin"],
     ),
 )
+
+
+@mcp.tool(name="guide")
+def guide() -> dict[str, Any]:
+    """Return the AppleHealth MCP usage and tool-selection guide in Chinese and English.
+
+    Use this as the first call when the user asks how to use AppleHealth, what health information is available, or
+    which tool should answer a request. This tool accepts no inputs and returns exact fully qualified tool names,
+    selection rules, valid argument examples, and a recommended call sequence. It does not return health values;
+    after reading the guide, immediately call the recommended data tool instead of answering from the guide alone.
+    """
+    return {
+        "server": "AppleHealth",
+        "purpose": "读取已上传到服务器的个人 Apple 健康数据；所有数据工具均为只读。",
+        "required_behavior": (
+            "根据用户问题选择下方工具并继续调用。guide 只负责导航，不能代替实际健康数据查询。"
+        ),
+        "recommended_sequence": [
+            {
+                "when": "首次使用、用户问有哪些数据，或不知道准确指标名",
+                "tool": "AppleHealth:list_available_data",
+                "arguments": {"output_format": "concise"},
+            },
+            {
+                "when": "用户要求最近几天的总体健康总结",
+                "tool": "AppleHealth:get_health_overview",
+                "arguments": {"days": 7},
+            },
+            {
+                "when": "用户查询步数、心率、睡眠、HRV、血氧、能量等时间序列",
+                "tool": "AppleHealth:query_health_metrics",
+                "arguments_example": {
+                    "metric_names": ["heart_rate"],
+                    "start_time": "2026-07-16",
+                    "end_time": "2026-07-18",
+                    "aggregation": "hour",
+                    "limit": 200,
+                    "output_format": "concise",
+                },
+            },
+            {
+                "when": "用户需要睡眠原始字段、入床/离床时间或完整导出对象",
+                "tool": "AppleHealth:query_health_metrics",
+                "arguments_example": {
+                    "metric_names": ["sleep_analysis"],
+                    "aggregation": "raw",
+                    "limit": 50,
+                    "output_format": "detailed",
+                },
+            },
+            {
+                "when": "用户查询锻炼、症状、ECG、药物或其他非指标事件",
+                "tool": "AppleHealth:query_health_events",
+                "arguments_example": {
+                    "categories": ["workouts"],
+                    "limit": 100,
+                    "output_format": "concise",
+                },
+            },
+        ],
+        "important_rules": [
+            "工具名称使用完整命名，例如 AppleHealth:get_health_overview。",
+            "日期使用 ISO-8601，例如 2026-07-18 或 2026-07-18T10:00:00+02:00。",
+            "不知道 metric_names 或 categories 时先调用 AppleHealth:list_available_data。",
+            "output_format=detailed 仅能与 aggregation=raw 一起用于健康指标查询。",
+            "没有返回记录通常表示客户端尚未上传该类别，不代表服务器连接失败。",
+            "健康数据仅用于信息总结，不应作为医疗诊断。",
+        ],
+    }
 
 
 @mcp.tool(name="list_available_data")
