@@ -103,7 +103,7 @@ NightsArgument = Annotated[
 WorkoutIdArgument = Annotated[
     str,
     Field(
-        description="Stable workout_id copied from list_workouts.",
+        description="Stable workout_id copied from apple_health_list_workouts.",
         min_length=1,
         examples=["935872D1-A7A1-428A-BD42-DE472862DC53"],
     ),
@@ -121,7 +121,7 @@ WorkoutTypeArgument = Annotated[
 MetricNamesArgument = Annotated[
     list[str],
     Field(
-        description="One to ten exact metric names from list_available_data.",
+        description="One to ten exact metric names from apple_health_list_available_data.",
         min_length=1,
         max_length=10,
         examples=[["heart_rate"]],
@@ -130,7 +130,7 @@ MetricNamesArgument = Annotated[
 CategoriesArgument = Annotated[
     list[str] | None,
     Field(
-        description="Optional exact event category names from list_available_data; null queries all categories.",
+        description="Optional exact event category names from apple_health_list_available_data; null queries all categories.",
         max_length=20,
         examples=[["cycleTracking"]],
     ),
@@ -295,7 +295,8 @@ mcp = FastMCP(
     name="AppleHealth",
     instructions=(
         "Personal health semantic layer for conversational AI. 普通睡眠、恢复和活动问题必须优先调用专用场景工具，"
-        "一次通常只调用1-2个工具。guide用于工具路由。list_available_data/query_health_metrics/query_health_events"
+        "一次通常只调用1-2个工具。apple_health_guide用于工具路由。"
+        "apple_health_list_available_data/apple_health_query_health_metrics/apple_health_query_health_events"
         "仅作为上传排查和原始数据调试的fallback。服务器负责时区、清洗、聚合、覆盖率和个人基线机械比较；"
         "AI负责结合对话解释，禁止医学诊断。"
     ),
@@ -318,14 +319,14 @@ mcp = FastMCP(
 )
 
 
-@mcp.tool(name="guide", annotations=READ_ONLY_TOOL)
+@mcp.tool(name="apple_health_guide", annotations=READ_ONLY_TOOL)
 def guide() -> GuideToolResponse:
     """Return the AppleHealth MCP usage and tool-selection guide in Chinese and English.
 
     Use this as the first call when the user asks how to use AppleHealth, what health information is available, or
     which tool should answer a request. This tool accepts no inputs and returns exact tools/list wire names,
     selection rules, argument templates/sources, and a recommended call sequence. It does not return health values;
-    after reading the guide, immediately call the recommended data tool instead of answering from the guide alone.
+    after reading apple_health_guide, immediately call the recommended data tool instead of answering from it alone.
     """
     as_of_date = datetime.now(ZoneInfo(DEFAULT_TIMEZONE)).date().isoformat()
     return {
@@ -334,70 +335,70 @@ def guide() -> GuideToolResponse:
         "purpose": "为对话AI提供已经清洗、聚合并带个人基线的健康语义上下文；所有数据工具均为只读。",
         "required_behavior": (
             "根据用户问题选择下方tools/list原始名称继续调用。宿主可能显示AppleHealth:前缀，但原始"
-            "tools/call.name必须使用tool字段。guide只负责导航，不能代替实际健康数据查询。"
+            "tools/call.name必须使用tool字段。apple_health_guide只负责导航，不能代替实际健康数据查询。"
         ),
         "recommended_sequence": [
             {
                 "when": "用户问昨晚睡得怎么样",
-                "tool": "get_sleep_summary",
+                "tool": "apple_health_get_sleep_summary",
                 "arguments_example": {"date": as_of_date},
             },
             {
                 "when": "用户问最近一周/两周/一月睡眠趋势",
-                "tool": "get_sleep_trend",
+                "tool": "apple_health_get_sleep_trend",
                 "arguments_example": {"nights": 7},
             },
             {
                 "when": "用户问疲劳、晨练前恢复状态或今天是否适合高强度运动",
-                "tool": "get_recovery_snapshot",
+                "tool": "apple_health_get_recovery_snapshot",
                 "arguments_example": {},
             },
             {
                 "when": "用户问今天的步数、活动量或晨练情况",
-                "tool": "get_daily_activity",
+                "tool": "apple_health_get_daily_activity",
                 "arguments_example": {"date": as_of_date},
             },
             {
                 "when": "用户问最近活动趋势",
-                "tool": "get_activity_trend",
+                "tool": "apple_health_get_activity_trend",
                 "arguments_example": {"days": 7},
             },
             {
                 "when": "用户问最近做过哪些锻炼、跑步、骑行或健身",
-                "tool": "list_workouts",
+                "tool": "apple_health_list_workouts",
                 "arguments_example": {"days": 7},
             },
             {
                 "when": "用户问某一次锻炼的距离、心率、能量、速度或路线是否存在",
-                "tool": "get_workout_detail",
-                "requires_previous_call": "list_workouts",
-                "arguments_source": "list_workouts.summary.workouts[].workout_id",
+                "tool": "apple_health_get_workout_detail",
+                "requires_previous_call": "apple_health_list_workouts",
+                "arguments_source": "apple_health_list_workouts.summary.workouts[].workout_id",
             },
             {
                 "when": "用户问这次锻炼相比上次或个人同类历史表现如何",
-                "tool": "compare_workouts",
-                "requires_previous_call": "list_workouts",
-                "arguments_source": "list_workouts.summary.workouts[].workout_id",
+                "tool": "apple_health_compare_workouts",
+                "requires_previous_call": "apple_health_list_workouts",
+                "arguments_source": "apple_health_list_workouts.summary.workouts[].workout_id",
                 "optional_arguments_example": {"baseline_count": 5},
             },
             {
                 "when": "用户要求最近7/14/30天的综合健康概览",
-                "tool": "get_health_overview",
+                "tool": "apple_health_get_health_overview",
                 "arguments_example": {"days": 7},
             },
             {
                 "when": "专用工具无法回答且精确指标名未知",
-                "tool": "list_available_data",
+                "tool": "apple_health_list_available_data",
                 "arguments_example": {"output_format": "concise"},
             },
             {
                 "when": "已知精确指标名且需要底层样本或机械聚合",
-                "tool": "query_health_metrics",
+                "tool": "apple_health_query_health_metrics",
                 "arguments_example": {"metric_names": ["heart_rate"], "limit": 20},
             },
             {
                 "when": "需要排查workout、经期或其他非指标事件",
-                "tool": "query_health_events",
+                "tool": "apple_health_query_health_events",
                 "arguments_example": {"categories": ["cycleTracking"], "limit": 20},
             },
         ],
@@ -416,7 +417,7 @@ def guide() -> GuideToolResponse:
     }
 
 
-@mcp.tool(name="get_sleep_summary", annotations=READ_ONLY_TOOL)
+@mcp.tool(name="apple_health_get_sleep_summary", annotations=READ_ONLY_TOOL)
 def get_sleep_summary(
     date: DateArgument,
     timezone: TimezoneArgument = DEFAULT_TIMEZONE,
@@ -436,7 +437,7 @@ def get_sleep_summary(
     return semantic_get_sleep_summary(get_settings().db_path, date, timezone, include_recovery_metrics, output_format)
 
 
-@mcp.tool(name="get_sleep_trend", annotations=READ_ONLY_TOOL)
+@mcp.tool(name="apple_health_get_sleep_trend", annotations=READ_ONLY_TOOL)
 def get_sleep_trend(
     nights: NightsArgument,
     timezone: TimezoneArgument = DEFAULT_TIMEZONE,
@@ -451,7 +452,7 @@ def get_sleep_trend(
     return semantic_get_sleep_trend(get_settings().db_path, nights, timezone, output_format, end_date)
 
 
-@mcp.tool(name="get_recovery_snapshot", annotations=READ_ONLY_TOOL)
+@mcp.tool(name="apple_health_get_recovery_snapshot", annotations=READ_ONLY_TOOL)
 def get_recovery_snapshot(
     date: OptionalDateArgument = None,
     timezone: TimezoneArgument = DEFAULT_TIMEZONE,
@@ -467,7 +468,7 @@ def get_recovery_snapshot(
     return semantic_get_recovery_snapshot(get_settings().db_path, date, timezone, output_format)
 
 
-@mcp.tool(name="get_daily_activity", annotations=READ_ONLY_TOOL)
+@mcp.tool(name="apple_health_get_daily_activity", annotations=READ_ONLY_TOOL)
 def get_daily_activity(
     date: DateArgument,
     timezone: TimezoneArgument = DEFAULT_TIMEZONE,
@@ -482,7 +483,7 @@ def get_daily_activity(
     return semantic_get_daily_activity(get_settings().db_path, date, timezone, output_format)
 
 
-@mcp.tool(name="get_activity_trend", annotations=READ_ONLY_TOOL)
+@mcp.tool(name="apple_health_get_activity_trend", annotations=READ_ONLY_TOOL)
 def get_activity_trend(
     days: DaysArgument,
     timezone: TimezoneArgument = DEFAULT_TIMEZONE,
@@ -497,7 +498,7 @@ def get_activity_trend(
     return semantic_get_activity_trend(get_settings().db_path, days, timezone, output_format, end_date)
 
 
-@mcp.tool(name="list_workouts", annotations=READ_ONLY_TOOL)
+@mcp.tool(name="apple_health_list_workouts", annotations=READ_ONLY_TOOL)
 def list_workouts(
     days: DaysArgument,
     timezone: TimezoneArgument = DEFAULT_TIMEZONE,
@@ -524,7 +525,7 @@ def list_workouts(
     )
 
 
-@mcp.tool(name="get_workout_detail", annotations=READ_ONLY_TOOL)
+@mcp.tool(name="apple_health_get_workout_detail", annotations=READ_ONLY_TOOL)
 def get_workout_detail(
     workout_id: WorkoutIdArgument,
     timezone: TimezoneArgument = DEFAULT_TIMEZONE,
@@ -532,7 +533,7 @@ def get_workout_detail(
 ) -> SemanticToolResponse:
     """Return one cleaned workout session with a same-type personal-baseline comparison.
 
-    Use after `list_workouts` when the user asks about one specific workout. `workout_id` must come from that
+    Use after `apple_health_list_workouts` when the user asks about one specific workout. `workout_id` must come from that
     tool. Returns local start/end time, duration, distance, energy, heart-rate range, speed/pace, elevation, sensor
     coverage, missing fields, and comparison with up to five prior workouts of the same type. Even detailed output is
     bounded and does not expose route coordinates or full heart-rate samples; use the raw fallback only for debugging.
@@ -540,13 +541,13 @@ def get_workout_detail(
     return semantic_get_workout_detail(get_settings().db_path, workout_id, timezone, output_format)
 
 
-@mcp.tool(name="compare_workouts", annotations=READ_ONLY_TOOL)
+@mcp.tool(name="apple_health_compare_workouts", annotations=READ_ONLY_TOOL)
 def compare_workouts(
     workout_id: WorkoutIdArgument,
     comparison_workout_id: Annotated[
         str | None,
         Field(
-            description="Optional same-type workout_id copied from list_workouts.",
+            description="Optional same-type workout_id copied from apple_health_list_workouts.",
             min_length=1,
         ),
     ] = None,
@@ -557,7 +558,7 @@ def compare_workouts(
     """Compare one workout with another workout or with the user's recent same-type baseline.
 
     Use for questions such as "这次骑行比上次怎样" or "这次跑步表现怎样". Obtain IDs from
-    `list_workouts`. When `comparison_workout_id` is provided, both sessions must have the same workout type;
+    `apple_health_list_workouts`. When `comparison_workout_id` is provided, both sessions must have the same workout type;
     otherwise it compares `workout_id` with up to `baseline_count` prior workouts of the same type. Returns mechanical
     absolute/percentage differences with coverage strength, not a medical or readiness judgment. `baseline_count`
     defaults to 5 and `output_format` defaults to concise.
@@ -572,7 +573,7 @@ def compare_workouts(
     )
 
 
-@mcp.tool(name="list_available_data", annotations=READ_ONLY_TOOL)
+@mcp.tool(name="apple_health_list_available_data", annotations=READ_ONLY_TOOL)
 def list_available_data(
     output_format: OutputFormatArgument = "concise",
     timezone: TimezoneArgument = DEFAULT_TIMEZONE,
@@ -588,7 +589,7 @@ def list_available_data(
     return list_available_data_semantic(get_settings().db_path, output_format, timezone)
 
 
-@mcp.tool(name="query_health_metrics", annotations=READ_ONLY_TOOL)
+@mcp.tool(name="apple_health_query_health_metrics", annotations=READ_ONLY_TOOL)
 def query_health_metrics(
     metric_names: MetricNamesArgument,
     start_time: StartTimeArgument = None,
@@ -604,7 +605,7 @@ def query_health_metrics(
     """Query numeric or categorical Apple Health metric samples over time.
 
     Fallback only: use for exact metric debugging or explicit raw record requests after specialized tools cannot answer.
-    Metric names are required exact names from `list_available_data`. Times accept ISO-8601 dates or timestamps;
+    Metric names are required exact names from `apple_health_list_available_data`. Times accept ISO-8601 dates or timestamps;
     sleep-analysis names specifically use YYYY-MM-DD wake-date boundaries,
     use a half-open [start_time,end_time) range, and default to the last 7 days. `raw` returns samples, while `hour` and `day` return mechanical
     aggregates. Set `output_format="detailed"` with `aggregation="raw"` to include the complete original exported sample,
@@ -657,7 +658,7 @@ def query_health_metrics(
     return metric_result
 
 
-@mcp.tool(name="query_health_events", annotations=READ_ONLY_TOOL)
+@mcp.tool(name="apple_health_query_health_events", annotations=READ_ONLY_TOOL)
 def query_health_events(
     categories: CategoriesArgument = None,
     start_time: StartTimeArgument = None,
@@ -669,7 +670,7 @@ def query_health_events(
     """Query non-metric Apple Health records such as workouts, symptoms, ECGs, medications, or cycle events.
 
     Fallback only: use for upload debugging or explicit raw event requests. Use event category names returned by
-    `list_available_data`; omit categories to query all. Times accept ISO-8601
+    `apple_health_list_available_data`; omit categories to query all. Times accept ISO-8601
     dates or timestamps, use a half-open [start_time,end_time) range, and default to the last 30 days. `concise` returns identifying fields; `detailed` includes
     original event payloads only within a bounded response budget and explicitly summarizes oversized omissions. `limit` defaults to 20 and is 1-500. Returns resolved filters and newest events first. Validation
     errors specify the parameter that must be corrected.
@@ -698,7 +699,7 @@ def query_health_events(
     return result
 
 
-@mcp.tool(name="get_health_overview", annotations=READ_ONLY_TOOL)
+@mcp.tool(name="apple_health_get_health_overview", annotations=READ_ONLY_TOOL)
 def get_health_overview(
     days: DaysArgument,
     timezone: TimezoneArgument = DEFAULT_TIMEZONE,

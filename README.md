@@ -51,22 +51,22 @@ Some MCP hosts display an `AppleHealth:` prefix in their UI; do not include that
 
 Primary scene tools:
 
-- `guide`
-- `get_sleep_summary`
-- `get_sleep_trend`
-- `get_recovery_snapshot`
-- `get_daily_activity`
-- `get_activity_trend`
-- `list_workouts`
-- `get_workout_detail`
-- `compare_workouts`
-- `get_health_overview`
+- `apple_health_guide`
+- `apple_health_get_sleep_summary`
+- `apple_health_get_sleep_trend`
+- `apple_health_get_recovery_snapshot`
+- `apple_health_get_daily_activity`
+- `apple_health_get_activity_trend`
+- `apple_health_list_workouts`
+- `apple_health_get_workout_detail`
+- `apple_health_compare_workouts`
+- `apple_health_get_health_overview`
 
 Fallback/debug tools:
 
-- `list_available_data`
-- `query_health_metrics`
-- `query_health_events`
+- `apple_health_list_available_data`
+- `apple_health_query_health_metrics`
+- `apple_health_query_health_events`
 
 Detailed scene outputs return requested/actual ranges, semantic summaries, personal-baseline comparison, bounded
 highlights, `fetch`, `coverage`, lifecycle state, and data quality. Concise outputs use smaller scene-specific contracts.
@@ -82,8 +82,9 @@ the fallback query tools. Oversized event payloads are replaced by a bounded key
 
 Fallback time filters use local half-open ranges: `[start_time,end_time)`. A date-only end value means local midnight
 at the start of that date, not the end of that date. Sleep-analysis fallback queries use date-only wake-date boundaries.
-Reversed or equal ranges are rejected. `query_health_metrics` requires one to ten exact `metric_names`; discover them
-with `list_available_data`. Metric/event result limits are explicit, and truncation is reported through
+Reversed or equal ranges are rejected. `apple_health_query_health_metrics` requires one to ten exact `metric_names`;
+discover them with `apple_health_list_available_data`. Metric/event result limits are explicit, and truncation is
+reported through
 `status=partial`, `fetch.complete=false`, and matched/returned counts.
 
 ## Semantic HTTP API
@@ -109,7 +110,7 @@ Workout scene APIs return compact session summaries and sensor coverage without 
 heart-rate samples. Cycle-tracking events are detected in capabilities and remain available through the raw-event
 fallback until a dedicated conversational scene contract is defined.
 
-For lossless metric debugging, call `query_health_metrics` with explicit `metric_names`, `aggregation="raw"`, and
+For lossless metric debugging, call `apple_health_query_health_metrics` with explicit `metric_names`, `aggregation="raw"`, and
 `output_format="detailed"`. The response then includes the complete original exported sample alongside normalized
 columns. Overlapping exports are reconciled by metric/source/time bucket so the latest value is queried while every
 original request remains retained for audit and future reprocessing.

@@ -91,34 +91,34 @@ def test_ingest_auth_and_health(tmp_path, monkeypatch) -> None:
         assert tools.status_code == 200
         tool_definitions = {tool["name"]: tool for tool in tools.json()["result"]["tools"]}
         assert set(tool_definitions) == {
-            "guide",
-            "get_sleep_summary",
-            "get_sleep_trend",
-            "get_recovery_snapshot",
-            "get_daily_activity",
-            "get_activity_trend",
-            "list_workouts",
-            "get_workout_detail",
-            "compare_workouts",
-            "list_available_data",
-            "query_health_metrics",
-            "query_health_events",
-            "get_health_overview",
+            "apple_health_guide",
+            "apple_health_get_sleep_summary",
+            "apple_health_get_sleep_trend",
+            "apple_health_get_recovery_snapshot",
+            "apple_health_get_daily_activity",
+            "apple_health_get_activity_trend",
+            "apple_health_list_workouts",
+            "apple_health_get_workout_detail",
+            "apple_health_compare_workouts",
+            "apple_health_list_available_data",
+            "apple_health_query_health_metrics",
+            "apple_health_query_health_events",
+            "apple_health_get_health_overview",
         }
         expected_required = {
-            "get_sleep_summary": ["date"],
-            "get_sleep_trend": ["nights"],
-            "get_recovery_snapshot": [],
-            "get_daily_activity": ["date"],
-            "get_activity_trend": ["days"],
-            "list_workouts": ["days"],
-            "get_workout_detail": ["workout_id"],
-            "compare_workouts": ["workout_id"],
-            "get_health_overview": ["days"],
+            "apple_health_get_sleep_summary": ["date"],
+            "apple_health_get_sleep_trend": ["nights"],
+            "apple_health_get_recovery_snapshot": [],
+            "apple_health_get_daily_activity": ["date"],
+            "apple_health_get_activity_trend": ["days"],
+            "apple_health_list_workouts": ["days"],
+            "apple_health_get_workout_detail": ["workout_id"],
+            "apple_health_compare_workouts": ["workout_id"],
+            "apple_health_get_health_overview": ["days"],
         }
         for tool_name, required in expected_required.items():
             assert tool_definitions[tool_name]["inputSchema"].get("required", []) == required
-        assert tool_definitions["query_health_metrics"]["inputSchema"].get("required", []) == ["metric_names"]
+        assert tool_definitions["apple_health_query_health_metrics"]["inputSchema"].get("required", []) == ["metric_names"]
         for tool in tool_definitions.values():
             assert tool["inputSchema"]["additionalProperties"] is False
             assert tool["annotations"]["readOnlyHint"] is True
@@ -127,26 +127,26 @@ def test_ingest_auth_and_health(tmp_path, monkeypatch) -> None:
             assert tool["annotations"]["openWorldHint"] is False
             for property_schema in tool["inputSchema"].get("properties", {}).values():
                 assert property_schema.get("description")
-        assert "status" in tool_definitions["get_sleep_summary"]["outputSchema"]["properties"]
-        assert "recommended_sequence" in tool_definitions["guide"]["outputSchema"]["properties"]
-        assert tool_definitions["query_health_events"]["outputSchema"]["properties"]["fetch"]
-        assert tool_definitions["query_health_events"]["outputSchema"]["properties"]["payloads"]
-        sleep_properties = tool_definitions["get_sleep_summary"]["inputSchema"]["properties"]
+        assert "status" in tool_definitions["apple_health_get_sleep_summary"]["outputSchema"]["properties"]
+        assert "recommended_sequence" in tool_definitions["apple_health_guide"]["outputSchema"]["properties"]
+        assert tool_definitions["apple_health_query_health_events"]["outputSchema"]["properties"]["fetch"]
+        assert tool_definitions["apple_health_query_health_events"]["outputSchema"]["properties"]["payloads"]
+        sleep_properties = tool_definitions["apple_health_get_sleep_summary"]["inputSchema"]["properties"]
         assert sleep_properties["date"]["pattern"] == r"^\d{4}-\d{2}-\d{2}$"
         assert sleep_properties["timezone"]["default"] == "Asia/Shanghai"
         assert sleep_properties["output_format"]["default"] == "concise"
         assert sleep_properties["include_recovery_metrics"]["default"] is True
-        assert tool_definitions["get_recovery_snapshot"]["inputSchema"]["properties"]["date"]["default"] is None
-        workout_properties = tool_definitions["list_workouts"]["inputSchema"]["properties"]
+        assert tool_definitions["apple_health_get_recovery_snapshot"]["inputSchema"]["properties"]["date"]["default"] is None
+        workout_properties = tool_definitions["apple_health_list_workouts"]["inputSchema"]["properties"]
         assert workout_properties["end_date"]["default"] is None
         assert workout_properties["workout_type"]["default"] is None
         assert workout_properties["limit"]["default"] == 20
         assert workout_properties["limit"]["minimum"] == 1
         assert workout_properties["limit"]["maximum"] == 50
-        metric_name_schema = tool_definitions["query_health_metrics"]["inputSchema"]["properties"]["metric_names"]
+        metric_name_schema = tool_definitions["apple_health_query_health_metrics"]["inputSchema"]["properties"]["metric_names"]
         assert metric_name_schema["minItems"] == 1
         assert metric_name_schema["maxItems"] == 10
-        compare_properties = tool_definitions["compare_workouts"]["inputSchema"]["properties"]
+        compare_properties = tool_definitions["apple_health_compare_workouts"]["inputSchema"]["properties"]
         assert compare_properties["comparison_workout_id"]["default"] is None
         assert compare_properties["baseline_count"]["default"] == 5
 
@@ -156,7 +156,7 @@ def test_ingest_auth_and_health(tmp_path, monkeypatch) -> None:
                 "jsonrpc": "2.0",
                 "id": 3,
                 "method": "tools/call",
-                "params": {"name": "list_available_data", "arguments": {}},
+                "params": {"name": "apple_health_list_available_data", "arguments": {}},
             },
             headers=mcp_headers,
         )
@@ -169,22 +169,22 @@ def test_ingest_auth_and_health(tmp_path, monkeypatch) -> None:
                 "jsonrpc": "2.0",
                 "id": 4,
                 "method": "tools/call",
-                "params": {"name": "guide", "arguments": {}},
+                "params": {"name": "apple_health_guide", "arguments": {}},
             },
             headers=mcp_headers,
         )
         assert guided.status_code == 200
         assert guided.json()["result"]["isError"] is False
         guide_text = json.dumps(guided.json(), ensure_ascii=False)
-        assert '"tool": "get_sleep_summary"' in guide_text
-        assert '"tool": "list_workouts"' in guide_text
-        assert '"tool": "compare_workouts"' in guide_text
-        assert '"tool": "get_health_overview"' in guide_text
+        assert '"tool": "apple_health_get_sleep_summary"' in guide_text
+        assert '"tool": "apple_health_list_workouts"' in guide_text
+        assert '"tool": "apple_health_compare_workouts"' in guide_text
+        assert '"tool": "apple_health_get_health_overview"' in guide_text
         assert "AppleHealth:list_available_data / query_health_metrics / query_health_events" not in guide_text
         guide_payload = guided.json()["result"]["structuredContent"]
         assert guide_payload["as_of_date"] == datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
         guide_entries = guide_payload["recommended_sequence"]
-        assert {entry["tool"] for entry in guide_entries} == set(tool_definitions) - {"guide"}
+        assert {entry["tool"] for entry in guide_entries} == set(tool_definitions) - {"apple_health_guide"}
         for entry in guide_entries:
             example = entry.get("arguments_example", {})
             assert set(example) <= set(tool_definitions[entry["tool"]]["inputSchema"].get("properties", {}))
@@ -196,7 +196,7 @@ def test_ingest_auth_and_health(tmp_path, monkeypatch) -> None:
                 "id": 5,
                 "method": "tools/call",
                 "params": {
-                    "name": "get_sleep_summary",
+                    "name": "apple_health_get_sleep_summary",
                     "arguments": {"date": "2026-07-18"},
                 },
             },
@@ -206,12 +206,12 @@ def test_ingest_auth_and_health(tmp_path, monkeypatch) -> None:
         assert sleep.json()["result"]["isError"] is False
 
         minimal_calls = [
-            (6, "get_sleep_trend", {"nights": 7}),
-            (7, "get_recovery_snapshot", {}),
-            (8, "get_daily_activity", {"date": "2026-07-18"}),
-            (9, "get_activity_trend", {"days": 7}),
-            (10, "list_workouts", {"days": 7}),
-            (11, "get_health_overview", {"days": 7}),
+            (6, "apple_health_get_sleep_trend", {"nights": 7}),
+            (7, "apple_health_get_recovery_snapshot", {}),
+            (8, "apple_health_get_daily_activity", {"date": "2026-07-18"}),
+            (9, "apple_health_get_activity_trend", {"days": 7}),
+            (10, "apple_health_list_workouts", {"days": 7}),
+            (11, "apple_health_get_health_overview", {"days": 7}),
         ]
         for call_id, tool_name, arguments in minimal_calls:
             response = client.post(
@@ -234,7 +234,7 @@ def test_ingest_auth_and_health(tmp_path, monkeypatch) -> None:
                 "id": 12,
                 "method": "tools/call",
                 "params": {
-                    "name": "get_daily_activity",
+                    "name": "apple_health_get_daily_activity",
                     "arguments": {"date": "2026-07-18", "time_zone": "UTC"},
                 },
             },
@@ -251,7 +251,7 @@ def test_ingest_auth_and_health(tmp_path, monkeypatch) -> None:
                 "jsonrpc": "2.0",
                 "id": 13,
                 "method": "tools/call",
-                "params": {"name": "query_health_metrics", "arguments": {}},
+                "params": {"name": "apple_health_query_health_metrics", "arguments": {}},
             },
             headers=mcp_headers,
         )
@@ -266,7 +266,7 @@ def test_ingest_auth_and_health(tmp_path, monkeypatch) -> None:
                 "id": 14,
                 "method": "tools/call",
                 "params": {
-                    "name": "query_health_metrics",
+                    "name": "apple_health_query_health_metrics",
                     "arguments": {"metric_names": ["heart_rate"], "limit": 1},
                 },
             },
@@ -285,7 +285,7 @@ def test_ingest_auth_and_health(tmp_path, monkeypatch) -> None:
                 "id": 15,
                 "method": "tools/call",
                 "params": {
-                    "name": "query_health_metrics",
+                    "name": "apple_health_query_health_metrics",
                     "arguments": {
                         "metric_names": ["sleep_analysis"],
                         "start_time": "2026-07-18",
@@ -306,7 +306,7 @@ def test_ingest_auth_and_health(tmp_path, monkeypatch) -> None:
                 "id": 16,
                 "method": "tools/call",
                 "params": {
-                    "name": "query_health_events",
+                    "name": "apple_health_query_health_events",
                     "arguments": {"limit": 1, "output_format": "detailed"},
                 },
             },
