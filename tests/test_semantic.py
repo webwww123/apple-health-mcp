@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from pathlib import Path
 
 from apple_health_mcp.semantic import (
@@ -13,7 +14,7 @@ from apple_health_mcp.semantic import (
     query_sleep_fallback,
     semantic_health_overview,
 )
-from apple_health_mcp.storage import store_ingestion
+from apple_health_mcp.storage import repair_historical_metric_duplicates, store_ingestion
 
 
 def _seed_semantic_data(db_path: Path) -> None:
@@ -249,7 +250,7 @@ def test_sleep_semantic_contract(tmp_path: Path) -> None:
     assert concise["baseline"] == {"nights": 1, "strength": "insufficient_data"}
     assert concise["sleep_session"]["is_closed"] is True
     assert concise["sleep_session"]["end"].endswith("+08:00")
-    assert concise["ingestion"]["may_still_update"] is True
+    assert concise["ingestion"]["may_still_update"] is False
     assert detailed["summary"]["stage_percentages"]["deep"] == 21.4
     assert detailed["summary"]["sleep_window"]["in_bed_minutes"] is None
     assert detailed["sleep_session"]["is_closed"] is True
@@ -382,8 +383,8 @@ def test_recovery_activity_and_overview_contracts(tmp_path: Path) -> None:
     assert activity["summary"]["activity"]["active_energy_kcal"] == 300.0
     assert activity["summary"]["activity"]["stand_hours"] == 10
     assert activity["fetch"]["complete"] is True
-    assert activity["period"]["is_closed"] is False
-    assert activity["period"]["may_still_update"] is True
+    assert activity["period"]["is_closed"] is True
+    assert activity["period"]["may_still_update"] is False
 
     trend = get_activity_trend(db_path, days=7, end_date="2026-07-18")
     assert trend["status"] == "partial"
@@ -446,7 +447,8 @@ def test_workout_semantic_contracts(tmp_path: Path) -> None:
     indoor = next(item for item in listed["summary"]["workouts"] if item["workout_id"] == "indoor-walk")
     assert "distance_too_low_for_reliable_pace" in indoor["quality_flags"]
     strength = next(item for item in listed["summary"]["workouts"] if item["workout_id"] == "strength-short")
-    assert {"very_short_workout", "possible_incomplete_workout"} <= set(strength["quality_flags"])
+    assert "very_short_workout" in strength["quality_flags"]
+    assert "possible_incomplete_workout" not in strength["quality_flags"]
 
     listed_detailed = list_workouts(
         db_path, days=7, end_date="2026-07-18", output_format="detailed"
@@ -479,3 +481,45 @@ def test_workout_semantic_contracts(tmp_path: Path) -> None:
     assert missing["status"] == "empty"
     assert missing["fetch"]["complete"] is True
     assert "AppleHealth:list_workouts" in missing["highlights"][0]
+
+
+def test_activity_duplicate_containment_and_baseline_exclusion(tmp_path: Path) -> None:
+    db_path = tmp_path / "health.db"
+    _seed_semantic_data(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO metric_samples (
+                ingestion_id, metric_name, unit, start_time, end_time, source,
+                source_name, numeric_value, sample_uuid, original_record_id,
+                fingerprint, payload_json
+            )
+            SELECT ingestion_id, metric_name, unit, start_time, end_time,
+                   'Apple Watch|iPhone|iPhone', 'Apple Watch|iPhone', numeric_value,
+                   sample_uuid, original_record_id, 'legacy-step-duplicate', payload_json
+            FROM metric_samples
+            WHERE metric_name='step_count' AND start_time='2026-07-18T02:00:00Z'
+            """
+        )
+        connection.commit()
+    repaired = repair_historical_metric_duplicates(db_path, dry_run=False)
+    assert repaired["archived_rows"] == 1
+
+    daily = get_daily_activity(db_path, "2026-07-18")
+    assert daily["status"] == "partial"
+    assert daily["summary"]["activity"]["step_count"] == 5000
+    assert daily["data_quality"]["baseline_eligible"] is False
+    assert daily["data_quality"]["deduplication"]["duplicates_removed"] == 1
+    assert "活动数据发现重复来源" in daily["highlights"][0]
+
+    trend = get_activity_trend(db_path, days=7, end_date="2026-07-18")
+    assert trend["status"] == "partial"
+    assert trend["summary"]["valid_days"] == 2
+    assert trend["summary"]["trusted_days"] == 1
+    assert trend["data_quality"]["baseline_eligible"] is False
+    assert trend["data_quality"]["contaminated_dates"] == ["2026-07-18"]
+
+    overview = semantic_health_overview(db_path, days=7, end_date="2026-07-18")
+    assert overview["status"] == "partial"
+    assert overview["data_quality"]["complete"] is False
+    assert "活动数据存在重复来源" in overview["highlights"][0]

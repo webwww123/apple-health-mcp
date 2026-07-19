@@ -115,3 +115,30 @@ journalctl -u apple-health-mcp.service -n 100 --no-pager
 ```
 
 Production data is stored at `/var/lib/apple-health-mcp/health.db`. Back up the database and its WAL files together, or use SQLite's online backup API while the service is running.
+
+### Metric deduplication audit
+
+Metric samples prefer HealthKit UUID/original record IDs. When the exporter omits them, the server uses a stable
+fingerprint of normalized metric/time/value/unit plus structured bundle/device identity; exporter-combined `source`
+strings are canonicalized for display and never used as raw-record identity. Cumulative activity aggregation then
+resolves overlapping timestamps by Watch/iPhone source priority.
+
+Run the read-only report before any repair:
+
+```bash
+uv run python scripts/audit_metric_duplicates.py \
+  --db /var/lib/apple-health-mcp/health.db \
+  --output /var/lib/apple-health-mcp/audits/dedup-dry-run.json
+```
+
+Historical repair requires a SQLite backup and maintenance window. `--repair` archives candidate duplicate rows in
+`metric_sample_duplicates`, rebuilds active normalized rows from retained raw ingestions, and writes the full report to
+`deduplication_audits`. The repair command refuses to run without a backup path:
+
+```bash
+uv run python scripts/audit_metric_duplicates.py \
+  --db /var/lib/apple-health-mcp/health.db \
+  --repair \
+  --backup /var/lib/apple-health-mcp/backups/health-before-dedup.db \
+  --output /var/lib/apple-health-mcp/audits/dedup-repair.json
+```

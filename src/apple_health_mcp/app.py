@@ -426,11 +426,16 @@ def query_health_metrics(
         aggregation=aggregation,
         limit=limit,
         output_format=output_format,
+        timezone=timezone,
     )
     metric_result = localize_fallback_metric_result(metric_result, timezone)
     if sleep_result is not None:
         return {
-            "status": "partial" if sleep_result["status"] == "partial" else "ok",
+            "status": (
+                "partial"
+                if sleep_result["status"] == "partial" or metric_result.get("status") == "partial"
+                else "ok"
+            ),
             "timezone": timezone,
             "sleep": sleep_result,
             "other_metrics": metric_result,
@@ -462,6 +467,7 @@ def query_health_events(
         end_time=end_time,
         limit=limit,
         output_format=output_format,
+        timezone=timezone,
     )
     try:
         zone = ZoneInfo(timezone)

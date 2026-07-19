@@ -9,7 +9,7 @@ from statistics import mean, median
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .storage import connect, initialize_database
+from .storage import aggregate_cumulative_metric, connect, initialize_database
 
 
 DEFAULT_TIMEZONE = "Asia/Shanghai"
@@ -1013,37 +1013,94 @@ def get_sleep_trend(
     return response
 
 
-def _daily_rows(db_path: Path, metric_name: str, day: Date, zone: ZoneInfo) -> list[dict[str, Any]]:
+def _activity_day_snapshot(db_path: Path, day: Date, zone: ZoneInfo) -> dict[str, Any]:
     start, end = _day_bounds(day, zone)
-    return _metric_rows(db_path, metric_name, start, end)
+    metric_names = (
+        "step_count",
+        "walking_running_distance",
+        "cycling_distance",
+        "active_energy",
+        "apple_exercise_time",
+        "apple_stand_time",
+        "apple_stand_hour",
+        "time_in_daylight",
+    )
+    metrics = {
+        name: aggregate_cumulative_metric(db_path, name, start, end, zone.key)
+        for name in metric_names
+    }
 
+    def total(name: str) -> float | None:
+        return _number(metrics[name].get("total"))
 
-def _daily_total(db_path: Path, metric_name: str, day: Date, zone: ZoneInfo) -> float | None:
-    return _sum_optional([_row_value(row) for row in _daily_rows(db_path, metric_name, day, zone)])
-
-
-def _daily_average(db_path: Path, metric_name: str, day: Date, zone: ZoneInfo) -> float | None:
-    return _mean([_row_value(row) for row in _daily_rows(db_path, metric_name, day, zone)])
+    active_energy_kj = total("active_energy")
+    activity = {
+        "date": day.isoformat(),
+        "step_count": round(total("step_count")) if total("step_count") is not None else None,
+        "walking_running_distance_km": _round(total("walking_running_distance"), 3),
+        "cycling_distance_km": _round(total("cycling_distance"), 3),
+        "active_energy_kcal": _round(active_energy_kj / 4.184, 1) if active_energy_kj is not None else None,
+        "exercise_minutes": (
+            round(total("apple_exercise_time"))
+            if total("apple_exercise_time") is not None
+            else None
+        ),
+        "stand_minutes": (
+            round(total("apple_stand_time"))
+            if total("apple_stand_time") is not None
+            else None
+        ),
+        "stand_hours": (
+            round(total("apple_stand_hour"))
+            if total("apple_stand_hour") is not None
+            else None
+        ),
+        "daylight_minutes": (
+            round(total("time_in_daylight"))
+            if total("time_in_daylight") is not None
+            else None
+        ),
+    }
+    metric_quality = {
+        name: {
+            **result["deduplication"],
+            "aggregation": result["aggregation"],
+            "baseline_eligible": result["baseline_eligible"],
+        }
+        for name, result in metrics.items()
+        if result["deduplication"]["raw_rows"] > 0
+    }
+    raw_rows = sum(item["raw_rows"] for item in metric_quality.values())
+    unique_rows = sum(item["unique_rows"] for item in metric_quality.values())
+    duplicates_removed = sum(item["duplicates_removed"] for item in metric_quality.values())
+    contaminated_metrics = sorted(
+        name for name, item in metric_quality.items() if item["duplicate_ratio"] > 0.05
+    )
+    return {
+        "activity": activity,
+        "quality": {
+            "deduplication": {
+                "applied": True,
+                "raw_rows": raw_rows,
+                "unique_rows": unique_rows,
+                "duplicates_removed": duplicates_removed,
+                "duplicate_ratio": round(duplicates_removed / raw_rows, 4) if raw_rows else 0.0,
+                "method": "stable_record_fingerprint_then_source_priority_overlap",
+                "by_metric": metric_quality,
+            },
+            "aggregation": {
+                "timezone": zone.key,
+                "method": "deduplicated_exported_interval_sum",
+                "authoritative_healthkit_daily_total": None,
+            },
+            "contaminated_metrics": contaminated_metrics,
+            "baseline_eligible": bool(metric_quality) and not contaminated_metrics,
+        },
+    }
 
 
 def _activity_day_values(db_path: Path, day: Date, zone: ZoneInfo) -> dict[str, Any]:
-    steps = _daily_total(db_path, "step_count", day, zone)
-    walking_distance = _daily_total(db_path, "walking_running_distance", day, zone)
-    cycling_distance = _daily_total(db_path, "cycling_distance", day, zone)
-    active_energy_kj = _daily_total(db_path, "active_energy", day, zone)
-    exercise = _daily_total(db_path, "apple_exercise_time", day, zone)
-    stand = _daily_total(db_path, "apple_stand_hour", day, zone)
-    daylight = _daily_total(db_path, "time_in_daylight", day, zone)
-    return {
-        "date": day.isoformat(),
-        "step_count": round(steps) if steps is not None else None,
-        "walking_running_distance_km": _round(walking_distance, 3),
-        "cycling_distance_km": _round(cycling_distance, 3),
-        "active_energy_kcal": _round(active_energy_kj / 4.184, 1) if active_energy_kj is not None else None,
-        "exercise_minutes": round(exercise) if exercise is not None else None,
-        "stand_hours": round(stand) if stand is not None else None,
-        "daylight_minutes": round(daylight) if daylight is not None else None,
-    }
+    return _activity_day_snapshot(db_path, day, zone)["activity"]
 
 
 def _quantity(payload: dict[str, Any], *keys: str) -> tuple[float | None, str | None]:
@@ -1886,11 +1943,32 @@ def _activity_baseline(
     lookback_days: int = 14,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     days = [target - timedelta(days=offset) for offset in range(lookback_days, 0, -1)]
-    values = [_activity_day_values(db_path, day, zone) for day in days]
-    valid = [item for item in values if any(value is not None for key, value in item.items() if key != "date")]
+    snapshots = [_activity_day_snapshot(db_path, day, zone) for day in days]
+    valid = [
+        snapshot["activity"]
+        for snapshot in snapshots
+        if snapshot["quality"]["baseline_eligible"]
+        and any(
+            value is not None
+            for key, value in snapshot["activity"].items()
+            if key != "date"
+        )
+    ]
+    excluded_dates = [
+        snapshot["activity"]["date"]
+        for snapshot in snapshots
+        if any(
+            value is not None
+            for key, value in snapshot["activity"].items()
+            if key != "date"
+        )
+        and not snapshot["quality"]["baseline_eligible"]
+    ]
     baseline = {
         "baseline_days": len(valid),
         "baseline_window": f"previous_{lookback_days}_days",
+        "excluded_days": len(excluded_dates),
+        "excluded_dates": excluded_dates,
         "step_count_average": _round(_mean([_number(item["step_count"]) for item in valid]), 0),
         "walking_running_distance_km_average": _round(
             _mean([_number(item["walking_running_distance_km"]) for item in valid]), 2
@@ -1911,7 +1989,9 @@ def get_daily_activity(
     _validate_output_format(output_format)
     target = _parse_date(date)
     zone = _zone(timezone)
-    activity = _activity_day_values(db_path, target, zone)
+    snapshot = _activity_day_snapshot(db_path, target, zone)
+    activity = snapshot["activity"]
+    activity_quality = snapshot["quality"]
     workouts = _workouts_for_day(db_path, target, zone)
     valid_fields = [key for key, value in activity.items() if key != "date" and value is not None]
     missing_fields = [key for key, value in activity.items() if key != "date" and value is None]
@@ -1934,35 +2014,34 @@ def get_daily_activity(
             "cycling_distance_km": "km",
             "active_energy_kcal": "kcal_converted_from_kJ",
             "exercise_minutes": "min",
+            "stand_minutes": "min",
+            "stand_hours": "count",
             "daylight_minutes": "min",
         }
     period = _period_state(target, zone)
-    semantic_complete = bool(valid_fields) and not missing_fields and period["is_closed"]
+    semantic_complete = (
+        bool(valid_fields)
+        and not missing_fields
+        and period["is_closed"]
+        and activity_quality["baseline_eligible"]
+    )
     status = "empty" if not valid_fields else "ok" if semantic_complete else "partial"
     highlights: list[str] = []
+    if activity_quality["contaminated_metrics"]:
+        highlights.append("活动数据发现重复来源，已去重但暂不用于个人基线判断")
     if activity["step_count"] is not None:
-        highlights.append(f"当天记录约{activity['step_count']}步")
+        highlights.append(f"去重后当天记录约{activity['step_count']}步")
     if activity["exercise_minutes"] is not None:
         highlights.append(f"锻炼时间约{activity['exercise_minutes']}分钟")
     if not period["is_closed"]:
         highlights.append("当天尚未结束，活动数据可能继续更新")
     if not workouts:
         highlights.append("当前未上传可关联的锻炼会话")
-    start, end = _day_bounds(target, zone)
     sources = sorted(
         {
-            row["source"]
-            for metric in (
-                "step_count",
-                "walking_running_distance",
-                "cycling_distance",
-                "active_energy",
-                "apple_exercise_time",
-                "apple_stand_hour",
-                "time_in_daylight",
-            )
-            for row in _metric_rows(db_path, metric, start, end)
-            if row.get("source")
+            source
+            for item in activity_quality["deduplication"]["by_metric"].values()
+            for source in item.get("sources", [])
         }
     )
     coverage = {
@@ -1997,6 +2076,14 @@ def get_daily_activity(
             },
         ),
     }
+    response["data_quality"].update(
+        {
+            "deduplication": activity_quality["deduplication"],
+            "aggregation": activity_quality["aggregation"],
+            "baseline_eligible": activity_quality["baseline_eligible"],
+            "contaminated_metrics": activity_quality["contaminated_metrics"],
+        }
+    )
     if output_format == "detailed":
         response["capabilities"] = capabilities(db_path)
     return response
@@ -2016,14 +2103,32 @@ def get_activity_trend(
     end = _parse_date(end_date) if end_date else datetime.now(zone).date()
     start = end - timedelta(days=days - 1)
     requested_days = _date_range(start, end)
-    daily = [_activity_day_values(db_path, day, zone) for day in requested_days]
+    snapshots = [_activity_day_snapshot(db_path, day, zone) for day in requested_days]
+    daily = [snapshot["activity"] for snapshot in snapshots]
     valid = [item for item in daily if any(value is not None for key, value in item.items() if key != "date")]
+    trusted = [
+        snapshot["activity"]
+        for snapshot in snapshots
+        if snapshot["quality"]["baseline_eligible"]
+        and any(
+            value is not None
+            for key, value in snapshot["activity"].items()
+            if key != "date"
+        )
+    ]
     missing = days - len(valid)
     previous_start = start - timedelta(days=days)
     previous_days = _date_range(previous_start, start - timedelta(days=1))
-    previous = [_activity_day_values(db_path, day, zone) for day in previous_days]
+    previous_snapshots = [_activity_day_snapshot(db_path, day, zone) for day in previous_days]
     previous_valid = [
-        item for item in previous if any(value is not None for key, value in item.items() if key != "date")
+        snapshot["activity"]
+        for snapshot in previous_snapshots
+        if snapshot["quality"]["baseline_eligible"]
+        and any(
+            value is not None
+            for key, value in snapshot["activity"].items()
+            if key != "date"
+        )
     ]
 
     def averages(items: list[dict[str, Any]]) -> dict[str, float | None]:
@@ -2034,29 +2139,37 @@ def get_activity_trend(
             ),
             "active_energy_kcal": _round(_mean([_number(item["active_energy_kcal"]) for item in items]), 1),
             "exercise_minutes": _round(_mean([_number(item["exercise_minutes"]) for item in items]), 1),
+            "stand_minutes": _round(_mean([_number(item["stand_minutes"]) for item in items]), 1),
             "stand_hours": _round(_mean([_number(item["stand_hours"]) for item in items]), 1),
             "daylight_minutes": _round(_mean([_number(item["daylight_minutes"]) for item in items]), 1),
         }
 
-    current_average = averages(valid)
+    trend_values = trusted if len(trusted) >= 3 else []
+    current_average = averages(trend_values)
     baseline_average = averages(previous_valid)
     summary: dict[str, Any] = {
         "requested_days": days,
         "valid_days": len(valid),
+        "trusted_days": len(trusted),
         "missing_days": missing,
         "daily_average": current_average,
         "period_totals": {
-            "step_count": round(_sum_optional([_number(item["step_count"]) for item in valid]) or 0)
-            if valid
+            "step_count": round(_sum_optional([_number(item["step_count"]) for item in trend_values]) or 0)
+            if trend_values
             else None,
             "walking_running_distance_km": _round(
-                _sum_optional([_number(item["walking_running_distance_km"]) for item in valid]), 2
+                _sum_optional([_number(item["walking_running_distance_km"]) for item in trend_values]), 2
             ),
             "active_energy_kcal": _round(
-                _sum_optional([_number(item["active_energy_kcal"]) for item in valid]), 1
+                _sum_optional([_number(item["active_energy_kcal"]) for item in trend_values]), 1
             ),
-            "exercise_minutes": round(_sum_optional([_number(item["exercise_minutes"]) for item in valid]) or 0)
-            if valid
+            "exercise_minutes": round(_sum_optional([_number(item["exercise_minutes"]) for item in trend_values]) or 0)
+            if trend_values
+            else None,
+            "stand_minutes": round(
+                _sum_optional([_number(item["stand_minutes"]) for item in trend_values]) or 0
+            )
+            if trend_values
             else None,
         },
     }
@@ -2074,35 +2187,45 @@ def get_activity_trend(
         "strength": _strength(len(previous_valid)),
     }
     period = _period_state(end, zone)
-    semantic_complete = missing == 0 and period["is_closed"]
+    excluded_current_days = len(valid) - len(trusted)
+    semantic_complete = missing == 0 and period["is_closed"] and excluded_current_days == 0
     status = "empty" if not valid else "ok" if semantic_complete else "partial"
     highlights: list[str] = []
+    if excluded_current_days:
+        highlights.append(
+            f"{excluded_current_days}天活动数据存在重复来源，已从趋势和个人基线中排除"
+        )
+    if 0 < len(trusted) < 3:
+        highlights.append(f"仅有{len(trusted)}个可信日，暂不生成活动趋势")
     if current_average["step_count"] is not None:
-        highlights.append(f"{len(valid)}个有效日平均约{round(current_average['step_count'])}步")
+        highlights.append(f"{len(trusted)}个可信日平均约{round(current_average['step_count'])}步")
     if len(valid) < 3:
         highlights.append(f"请求{days}天但只有{len(valid)}天有效数据，趋势判断为样本不足")
     elif missing:
         highlights.append(f"请求范围内缺少{missing}天数据")
     if not period["is_closed"]:
         highlights.append("结束日期仍是进行中的自然日，汇总可能继续更新")
-    period_start, _ = _day_bounds(start, zone)
-    _, period_end = _day_bounds(end, zone)
     sources = sorted(
         {
-            row["source"]
-            for metric in (
-                "step_count",
-                "walking_running_distance",
-                "cycling_distance",
-                "active_energy",
-                "apple_exercise_time",
-                "apple_stand_hour",
-                "time_in_daylight",
-            )
-            for row in _metric_rows(db_path, metric, period_start, period_end)
-            if row.get("source")
+            source
+            for snapshot in snapshots
+            for item in snapshot["quality"]["deduplication"]["by_metric"].values()
+            for source in item.get("sources", [])
         }
     )
+    raw_rows = sum(snapshot["quality"]["deduplication"]["raw_rows"] for snapshot in snapshots)
+    unique_rows = sum(
+        snapshot["quality"]["deduplication"]["unique_rows"] for snapshot in snapshots
+    )
+    duplicates_removed = sum(
+        snapshot["quality"]["deduplication"]["duplicates_removed"]
+        for snapshot in snapshots
+    )
+    contaminated_dates = [
+        snapshot["activity"]["date"]
+        for snapshot in snapshots
+        if snapshot["quality"]["contaminated_metrics"]
+    ]
     coverage = {"complete": missing == 0, "valid_days": len(valid), "missing_days": missing}
     response: dict[str, Any] = {
         "status": status,
@@ -2133,6 +2256,31 @@ def get_activity_trend(
             },
         ),
     }
+    response["data_quality"].update(
+        {
+            "deduplication": {
+                "applied": True,
+                "raw_rows": raw_rows,
+                "unique_rows": unique_rows,
+                "duplicates_removed": duplicates_removed,
+                "duplicate_ratio": (
+                    round(duplicates_removed / raw_rows, 4) if raw_rows else 0.0
+                ),
+                "method": "stable_record_fingerprint_then_source_priority_overlap",
+            },
+            "aggregation": {
+                "timezone": zone.key,
+                "method": "deduplicated_exported_interval_sum",
+                "authoritative_healthkit_daily_total": None,
+            },
+            "baseline_eligible": excluded_current_days == 0,
+            "contaminated_dates": contaminated_dates,
+        }
+    )
+    if output_format == "detailed":
+        response["data_quality"]["by_day"] = {
+            snapshot["activity"]["date"]: snapshot["quality"] for snapshot in snapshots
+        }
     if output_format == "detailed":
         response["capabilities"] = capabilities(db_path)
     return response
@@ -2448,9 +2596,13 @@ def semantic_health_overview(
         activity["coverage"]["complete"]
         and sleep["coverage"]["complete"]
         and period["is_closed"]
+        and activity["data_quality"].get("complete", False)
     )
     status = "empty" if valid_days == 0 and valid_nights == 0 else "ok" if semantic_complete else "partial"
-    highlights = (sleep.get("highlights", []) + activity.get("highlights", []))[:3]
+    if not activity["data_quality"].get("baseline_eligible", True):
+        highlights = (activity.get("highlights", [])[:1] + sleep.get("highlights", []))[:3]
+    else:
+        highlights = (sleep.get("highlights", []) + activity.get("highlights", []))[:3]
     coverage = {
         "complete": bool(activity["coverage"]["complete"] and sleep["coverage"]["complete"]),
         "valid_days": valid_days,
@@ -2475,6 +2627,7 @@ def semantic_health_overview(
             "summary": {
                 "activity": {
                     "valid_days": activity_summary.get("valid_days"),
+                    "trusted_days": activity_summary.get("trusted_days"),
                     "average_steps": activity_summary.get("daily_average", {}).get("step_count"),
                     "average_active_energy_kcal": activity_summary.get("daily_average", {}).get(
                         "active_energy_kcal"
