@@ -122,6 +122,16 @@ curl https://apps.supxh.xin/apple-health/health
 journalctl -u apple-health-mcp.service -n 100 --no-pager
 ```
 
+Production runs as the unprivileged `apple-health` user. Normalize source and installed-wheel read permissions when
+deploying from a root-owned checkout; otherwise a non-editable wheel can preserve root-only source modes:
+
+```bash
+umask 022
+chmod -R a+rX src/apple_health_mcp
+uv sync --locked --no-editable
+chmod -R a+rX .venv/lib/python*/site-packages/apple_health_mcp*
+```
+
 Production data is stored at `/var/lib/apple-health-mcp/health.db`. Back up the database and its WAL files together, or use SQLite's online backup API while the service is running.
 
 ### Metric deduplication audit
