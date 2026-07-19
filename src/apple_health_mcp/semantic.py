@@ -116,19 +116,39 @@ def _latest_ingestion(db_path: Path, zone: ZoneInfo) -> str | None:
     return _local_iso(_parse_datetime(value), zone)
 
 
-def _period_state(end_date: Date, zone: ZoneInfo) -> dict[str, bool]:
-    is_closed = end_date < datetime.now(zone).date()
-    return {"is_closed": is_closed, "may_still_update": not is_closed}
+def _period_state(end_date: Date, zone: ZoneInfo) -> dict[str, Any]:
+    today = datetime.now(zone).date()
+    if end_date < today:
+        return {
+            "state": "closed",
+            "has_started": True,
+            "is_closed": True,
+            "may_still_update": False,
+        }
+    if end_date == today:
+        return {
+            "state": "in_progress",
+            "has_started": True,
+            "is_closed": False,
+            "may_still_update": True,
+        }
+    return {
+        "state": "not_started",
+        "has_started": False,
+        "is_closed": False,
+        "may_still_update": False,
+    }
+
+
+def _validate_not_future(value: Date, zone: ZoneInfo, field_name: str) -> None:
+    if value > datetime.now(zone).date():
+        raise ValueError(f"{field_name} must not be in the future; use today's date or an earlier YYYY-MM-DD")
 
 
 def _sleep_session_state(session: dict[str, Any], zone: ZoneInfo) -> dict[str, Any]:
     trusted_end = session.get("trusted_end")
     return {
-        "is_closed": (
-            datetime.now(zone) >= trusted_end.astimezone(zone)
-            if trusted_end is not None
-            else None
-        ),
+        "is_closed": (datetime.now(zone) >= trusted_end.astimezone(zone) if trusted_end is not None else None),
         "end": _local_iso(trusted_end, zone),
     }
 
@@ -303,11 +323,7 @@ def _sleep_sessions(db_path: Path, zone: ZoneInfo) -> list[dict[str, Any]]:
                 implausible_window = True
                 quality_flags.append("implausible_sleep_window")
 
-        boundary_confidence = (
-            "low"
-            if implausible_window or reported_start is None or reported_end is None
-            else "high"
-        )
+        boundary_confidence = "low" if implausible_window or reported_start is None or reported_end is None else "high"
         trusted_start = reported_start if boundary_confidence == "high" else None
         trusted_end = reported_end if boundary_confidence == "high" else None
         sleep_window_minutes = reported_window_minutes if boundary_confidence == "high" else None
@@ -321,14 +337,17 @@ def _sleep_sessions(db_path: Path, zone: ZoneInfo) -> list[dict[str, Any]]:
                 quality_flags.append("implausible_in_bed_duration")
                 in_bed_minutes = None
         sleep_efficiency = (
-            _round(total_sleep / in_bed_minutes * 100, 1)
-            if total_sleep is not None and in_bed_minutes
-            else None
+            _round(total_sleep / in_bed_minutes * 100, 1) if total_sleep is not None and in_bed_minutes else None
         )
 
         if total_sleep is None:
             missing_fields.append("totalSleep")
-        for key, value in (("core", core), ("deep", deep), ("rem", rem), ("awake", awake)):
+        for key, value in (
+            ("core", core),
+            ("deep", deep),
+            ("rem", rem),
+            ("awake", awake),
+        ):
             if value is None:
                 missing_fields.append(key)
 
@@ -337,9 +356,7 @@ def _sleep_sessions(db_path: Path, zone: ZoneInfo) -> list[dict[str, Any]]:
         candidate = {
             "sleep_date": wake_date,
             "source": row["source"],
-            "session_id": _stable_sleep_session_id(
-                payload, row["source"], wake_date, reported_start, reported_end
-            ),
+            "session_id": _stable_sleep_session_id(payload, row["source"], wake_date, reported_start, reported_end),
             "received_at": _parse_datetime(row["received_at"]),
             "reported_start": reported_start,
             "reported_end": reported_end,
@@ -368,10 +385,14 @@ def _sleep_sessions(db_path: Path, zone: ZoneInfo) -> list[dict[str, Any]]:
         }
         existing = by_wake_date.get(wake_date)
         existing_score = (
-            int("watch" in str(existing.get("source", "")).lower()),
-            int(existing.get("boundary_confidence") == "high"),
-            existing.get("total_sleep_minutes") or -1,
-        ) if existing else (-1, -1, -1)
+            (
+                int("watch" in str(existing.get("source", "")).lower()),
+                int(existing.get("boundary_confidence") == "high"),
+                existing.get("total_sleep_minutes") or -1,
+            )
+            if existing
+            else (-1, -1, -1)
+        )
         candidate_score = (
             int("watch" in str(candidate.get("source", "")).lower()),
             int(candidate.get("boundary_confidence") == "high"),
@@ -435,20 +456,12 @@ def _recovery_for_session(
     respiratory = [_row_value(row) for row in respiratory_rows]
     oxygen = [_normalize_percent(_row_value(row)) for row in oxygen_rows]
     present_oxygen = [value for value in oxygen if value is not None]
-    sleep_logic = (
-        "trusted_sleep_interval"
-        if trusted_interval
-        else "not_queried_due_low_boundary_confidence"
-    )
+    sleep_logic = "trusted_sleep_interval" if trusted_interval else "not_queried_due_low_boundary_confidence"
     sleep_confidence = "high" if trusted_interval else "low"
 
     hrv_start = trusted_end - timedelta(hours=2) if trusted_interval else None
     hrv_end = trusted_end + timedelta(hours=2) if trusted_interval else None
-    hrv_rows = (
-        _metric_rows(db_path, "heart_rate_variability", hrv_start, hrv_end)
-        if hrv_start and hrv_end
-        else []
-    )
+    hrv_rows = _metric_rows(db_path, "heart_rate_variability", hrv_start, hrv_end) if hrv_start and hrv_end else []
     hrv_values = [_row_value(row) for row in hrv_rows]
     hrv_confidence = "medium" if trusted_interval and len(hrv_values) >= 2 else "low"
 
@@ -468,9 +481,7 @@ def _recovery_for_session(
     if temperature_rows and trusted_end:
         closest = min(
             temperature_rows,
-            key=lambda row: abs(
-                ((_parse_datetime(row["start_time"]) or trusted_end) - trusted_end).total_seconds()
-            ),
+            key=lambda row: abs(((_parse_datetime(row["start_time"]) or trusted_end) - trusted_end).total_seconds()),
         )
         temperature_value = _round(_row_value(closest), 2)
 
@@ -597,9 +608,7 @@ def _reported_wake_diagnostic_candidates(
     if temperature_rows:
         closest = min(
             temperature_rows,
-            key=lambda row: abs(
-                ((_parse_datetime(row["start_time"]) or reported_end) - reported_end).total_seconds()
-            ),
+            key=lambda row: abs(((_parse_datetime(row["start_time"]) or reported_end) - reported_end).total_seconds()),
         )
         candidates["reported_wake_based_wrist_temperature"] = {
             "value": _round(_row_value(closest), 2),
@@ -689,9 +698,7 @@ def _sleep_summary_payload(
     baseline = _sleep_baseline(all_sessions, session["sleep_date"])
     full_comparison = _sleep_comparison(session, baseline)
     recovery = _recovery_for_session(db_path, session, zone) if include_recovery_metrics else None
-    recovery_missing = [
-        key for key, metric in (recovery or {}).items() if metric.get("value") is None
-    ]
+    recovery_missing = [key for key, metric in (recovery or {}).items() if metric.get("value") is None]
     complete = not session["missing_fields"] and not session["quality_flags"]
     if include_recovery_metrics and recovery_missing:
         complete = False
@@ -702,9 +709,7 @@ def _sleep_summary_payload(
     trusted_end = _local_iso(session.get("trusted_end"), zone)
     latest_ingestion = _latest_ingestion(db_path, zone)
     sleep_session = _sleep_session_state(session, zone)
-    ingestion_may_update = _period_state(_parse_date(session["sleep_date"]), zone)[
-        "may_still_update"
-    ]
+    ingestion_may_update = _period_state(_parse_date(session["sleep_date"]), zone)["may_still_update"]
 
     if output_format == "concise":
         concise_summary = {
@@ -739,15 +744,9 @@ def _sleep_summary_payload(
         }
         if include_recovery_metrics:
             response["recovery"] = {
-                "sleeping_heart_rate_avg_bpm": _recovery_value(
-                    recovery or {}, "sleeping_heart_rate_avg_bpm"
-                ),
-                "respiratory_rate_avg_per_min": _recovery_value(
-                    recovery or {}, "respiratory_rate_avg_per_min"
-                ),
-                "blood_oxygen_avg_percent": _recovery_value(
-                    recovery or {}, "blood_oxygen_avg_percent"
-                ),
+                "sleeping_heart_rate_avg_bpm": _recovery_value(recovery or {}, "sleeping_heart_rate_avg_bpm"),
+                "respiratory_rate_avg_per_min": _recovery_value(recovery or {}, "respiratory_rate_avg_per_min"),
+                "blood_oxygen_avg_percent": _recovery_value(recovery or {}, "blood_oxygen_avg_percent"),
             }
         return response
 
@@ -831,12 +830,25 @@ def get_sleep_summary(
     _validate_output_format(output_format)
     target = _parse_date(date)
     zone = _zone(timezone)
+    period_state = _period_state(target, zone)
     sessions = _sleep_sessions(db_path, zone)
-    session = next((item for item in sessions if item["sleep_date"] == target.isoformat()), None)
+    session = (
+        next(
+            (item for item in sessions if item["sleep_date"] == target.isoformat()),
+            None,
+        )
+        if period_state["has_started"]
+        else None
+    )
     if session is None:
         coverage = {"complete": False, "valid_nights": 0, "missing_nights": 1}
         latest_ingestion = _latest_ingestion(db_path, zone)
-        may_still_update = _period_state(target, zone)["may_still_update"]
+        may_still_update = period_state["may_still_update"]
+        empty_highlight = (
+            "该醒来日期尚未开始，没有可查询的睡眠记录"
+            if not period_state["has_started"]
+            else "该醒来日期没有已上传的睡眠记录"
+        )
         if output_format == "concise":
             return {
                 "status": "empty",
@@ -844,12 +856,16 @@ def get_sleep_summary(
                 "summary": {},
                 "baseline": {"nights": 0, "strength": "insufficient_data"},
                 "sleep_session": {"is_closed": None, "end": None},
+                "period": period_state,
                 "ingestion": {
                     "may_still_update": may_still_update,
                     "latest_ingestion": latest_ingestion,
                 },
-                "highlights": ["该醒来日期没有已上传的睡眠记录"],
-                "data_quality": {"complete": False, "may_still_update": may_still_update},
+                "highlights": [empty_highlight],
+                "data_quality": {
+                    "complete": False,
+                    "may_still_update": may_still_update,
+                },
             }
         response: dict[str, Any] = {
             "status": "empty",
@@ -858,10 +874,14 @@ def get_sleep_summary(
             "requested_range": {"sleep_date": target.isoformat()},
             "actual_data_range": None,
             "summary": {},
-            "comparison_to_personal_baseline": {"baseline_nights": 0, "strength": "insufficient_data"},
+            "comparison_to_personal_baseline": {
+                "baseline_nights": 0,
+                "strength": "insufficient_data",
+            },
             "highlights": ["该醒来日期没有已上传的睡眠记录"],
             "fetch": {"complete": True},
             "coverage": coverage,
+            "period": period_state,
             "sleep_session": {"is_closed": None, "end": None},
             "ingestion": {
                 "may_still_update": may_still_update,
@@ -881,6 +901,7 @@ def get_sleep_summary(
                 },
             ),
         }
+        response["highlights"] = [empty_highlight]
         if output_format == "detailed":
             response["capabilities"] = capabilities(db_path)
         return response
@@ -906,6 +927,7 @@ def get_sleep_trend(
         raise ValueError("nights must be one of 7, 14, or 30")
     zone = _zone(timezone)
     end = _parse_date(end_date) if end_date else datetime.now(zone).date()
+    _validate_not_future(end, zone, "end_date")
     start = end - timedelta(days=nights - 1)
     all_sessions = _sleep_sessions(db_path, zone)
     selected = [item for item in all_sessions if start.isoformat() <= item["sleep_date"] <= end.isoformat()]
@@ -962,7 +984,10 @@ def get_sleep_trend(
             for item in selected
         ]
     actual = (
-        {"start_date": selected[0]["sleep_date"], "end_date": selected[-1]["sleep_date"]}
+        {
+            "start_date": selected[0]["sleep_date"],
+            "end_date": selected[-1]["sleep_date"],
+        }
         if selected
         else None
     )
@@ -974,15 +999,26 @@ def get_sleep_trend(
     average_total = summary["average_total_sleep_minutes"]
     if average_total is not None:
         highlights.append(f"{valid}晚平均总睡眠约{average_total // 60}小时{average_total % 60}分钟")
+    low_boundary_dates = [item["sleep_date"] for item in selected if item.get("boundary_confidence") != "high"]
+    if low_boundary_dates:
+        highlights.append(f"{','.join(low_boundary_dates)}边界置信度低，相关恢复窗口未用于判断")
     if valid < 3:
         highlights.append(f"请求{nights}晚但只有{valid}晚有效数据，趋势判断为样本不足")
     elif missing:
         highlights.append(f"请求范围内缺少{missing}晚数据，趋势仅基于有效夜晚")
-    coverage = {"complete": missing == 0, "valid_nights": valid, "missing_nights": missing}
+    coverage = {
+        "complete": missing == 0,
+        "valid_nights": valid,
+        "missing_nights": missing,
+    }
     response: dict[str, Any] = {
         "status": status,
         "timezone": zone.key,
-        "requested_range": {"start_date": start.isoformat(), "end_date": end.isoformat(), "nights": nights},
+        "requested_range": {
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+            "nights": nights,
+        },
         "actual_data_range": actual,
         "summary": summary,
         "comparison_to_personal_baseline": {
@@ -1025,10 +1061,7 @@ def _activity_day_snapshot(db_path: Path, day: Date, zone: ZoneInfo) -> dict[str
         "apple_stand_hour",
         "time_in_daylight",
     )
-    metrics = {
-        name: aggregate_cumulative_metric(db_path, name, start, end, zone.key)
-        for name in metric_names
-    }
+    metrics = {name: aggregate_cumulative_metric(db_path, name, start, end, zone.key) for name in metric_names}
 
     def total(name: str) -> float | None:
         return _number(metrics[name].get("total"))
@@ -1040,26 +1073,10 @@ def _activity_day_snapshot(db_path: Path, day: Date, zone: ZoneInfo) -> dict[str
         "walking_running_distance_km": _round(total("walking_running_distance"), 3),
         "cycling_distance_km": _round(total("cycling_distance"), 3),
         "active_energy_kcal": _round(active_energy_kj / 4.184, 1) if active_energy_kj is not None else None,
-        "exercise_minutes": (
-            round(total("apple_exercise_time"))
-            if total("apple_exercise_time") is not None
-            else None
-        ),
-        "stand_minutes": (
-            round(total("apple_stand_time"))
-            if total("apple_stand_time") is not None
-            else None
-        ),
-        "stand_hours": (
-            round(total("apple_stand_hour"))
-            if total("apple_stand_hour") is not None
-            else None
-        ),
-        "daylight_minutes": (
-            round(total("time_in_daylight"))
-            if total("time_in_daylight") is not None
-            else None
-        ),
+        "exercise_minutes": (round(total("apple_exercise_time")) if total("apple_exercise_time") is not None else None),
+        "stand_minutes": (round(total("apple_stand_time")) if total("apple_stand_time") is not None else None),
+        "stand_hours": (round(total("apple_stand_hour")) if total("apple_stand_hour") is not None else None),
+        "daylight_minutes": (round(total("time_in_daylight")) if total("time_in_daylight") is not None else None),
     }
     metric_quality = {
         name: {
@@ -1073,9 +1090,7 @@ def _activity_day_snapshot(db_path: Path, day: Date, zone: ZoneInfo) -> dict[str
     raw_rows = sum(item["raw_rows"] for item in metric_quality.values())
     unique_rows = sum(item["unique_rows"] for item in metric_quality.values())
     duplicates_removed = sum(item["duplicates_removed"] for item in metric_quality.values())
-    contaminated_metrics = sorted(
-        name for name, item in metric_quality.items() if item["duplicate_ratio"] > 0.05
-    )
+    contaminated_metrics = sorted(name for name, item in metric_quality.items() if item["duplicate_ratio"] > 0.05)
     return {
         "activity": activity,
         "quality": {
@@ -1101,6 +1116,21 @@ def _activity_day_snapshot(db_path: Path, day: Date, zone: ZoneInfo) -> dict[str
 
 def _activity_day_values(db_path: Path, day: Date, zone: ZoneInfo) -> dict[str, Any]:
     return _activity_day_snapshot(db_path, day, zone)["activity"]
+
+
+def _compact_deduplication(quality: dict[str, Any]) -> dict[str, Any]:
+    deduplication = quality.get("deduplication", {})
+    return {
+        key: deduplication.get(key)
+        for key in (
+            "applied",
+            "raw_rows",
+            "unique_rows",
+            "duplicates_removed",
+            "duplicate_ratio",
+            "method",
+        )
+    }
 
 
 def _quantity(payload: dict[str, Any], *keys: str) -> tuple[float | None, str | None]:
@@ -1180,7 +1210,7 @@ def _workout_rows(
                    he.payload_json, i.received_at
             FROM health_events he
             JOIN ingestions i ON i.id = he.ingestion_id
-            WHERE {' AND '.join(clauses)}
+            WHERE {" AND ".join(clauses)}
             ORDER BY he.start_time DESC
             """,
             params,
@@ -1229,17 +1259,24 @@ def _workout_summary(row: dict[str, Any], zone: ZoneInfo, detailed: bool = False
     activity_name = str(row.get("event_type") or payload.get("name") or "未知锻炼")
     normalized_name = activity_name.casefold()
     pace_minutes_per_km = None
-    if distance_km and duration_minutes is not None and any(
-        marker in normalized_name for marker in ("步行", "跑", "walk", "run")
+    if (
+        distance_km
+        and duration_minutes is not None
+        and any(marker in normalized_name for marker in ("步行", "跑", "walk", "run"))
     ):
         pace_minutes_per_km = duration_minutes / distance_km
         derived_fields.append("pace_minutes_per_km")
     distance_activity = any(marker in normalized_name for marker in ("步行", "跑", "walk", "run", "骑行", "cycl"))
     pace_activity = any(marker in normalized_name for marker in ("步行", "跑", "walk", "run"))
-    if pace_activity and duration_minutes is not None and duration_minutes >= 10 and (
-        distance_km is None or distance_km < 0.2
+    if (
+        pace_activity
+        and duration_minutes is not None
+        and duration_minutes >= 10
+        and (distance_km is None or distance_km < 0.2)
     ):
         pace_minutes_per_km = None
+        average_speed_kmh = None
+        derived_fields = [field for field in derived_fields if field != "average_speed_kmh"]
         quality_flags.append("distance_too_low_for_reliable_pace")
     if duration_minutes is not None and duration_minutes < 5:
         quality_flags.append("very_short_workout")
@@ -1268,7 +1305,10 @@ def _workout_summary(row: dict[str, Any], zone: ZoneInfo, detailed: bool = False
     missing_fields = [
         field
         for field, value in (
-            ("workout_id", row.get("event_uuid") or payload.get("id") or payload.get("uuid")),
+            (
+                "workout_id",
+                row.get("event_uuid") or payload.get("id") or payload.get("uuid"),
+            ),
             ("start", start),
             ("end", end),
             ("duration_minutes", duration_minutes),
@@ -1331,13 +1371,22 @@ def _workout_summary(row: dict[str, Any], zone: ZoneInfo, detailed: bool = False
             if value is not None
         ]
         workout["normalization"] = {
+            "average_speed": {
+                "reported_value": _round(average_speed_quantity, 3),
+                "reported_unit": average_speed_unit,
+                "normalized_value_kmh": _round(average_speed_kmh, 2),
+                "normalization_rule": (
+                    "suppress_when_distance_coverage_is_too_low"
+                    if "distance_too_low_for_reliable_pace" in quality_flags
+                    else "normalize_explicit_speed_or_derive_from_reliable_distance_and_duration"
+                ),
+                "confidence": ("low" if "distance_too_low_for_reliable_pace" in quality_flags else "high"),
+            },
             "max_speed": {
                 "reported_value": _round(max_speed_quantity, 3),
                 "reported_unit": max_speed_unit,
                 "normalized_value_kmh": _round(max_speed_kmh, 2),
-                "normalization_rule": (
-                    "accept_only_explicit_speed_units; reject_distance_only_unit_km"
-                ),
+                "normalization_rule": ("accept_only_explicit_speed_units; reject_distance_only_unit_km"),
                 "official_expected_units": ["mph", "kmph"],
                 "confidence": (
                     "high"
@@ -1352,19 +1401,12 @@ def _workout_summary(row: dict[str, Any], zone: ZoneInfo, detailed: bool = False
                 "confidence": "low" if "distance_too_low_for_reliable_pace" in quality_flags else "high",
             },
         }
-    baseline_blocking_flags = {
-        "distance_too_low_for_reliable_pace",
-        "very_short_workout",
-        "possible_incomplete_workout",
-        "implausible_average_speed",
-        "implausible_max_speed",
-    }
     workout["_quality"] = {
         "complete": not missing_fields,
         "missing_fields": missing_fields,
         "derived_fields": derived_fields,
         "quality_flags": quality_flags,
-        "baseline_eligible": not bool(baseline_blocking_flags.intersection(quality_flags)),
+        "baseline_eligible": not bool(_BASELINE_BLOCKING_WORKOUT_FLAGS.intersection(quality_flags)),
     }
     return workout
 
@@ -1409,33 +1451,32 @@ def _compact_workout_type_stats(stats: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_BASELINE_BLOCKING_WORKOUT_FLAGS = {
+    "distance_too_low_for_reliable_pace",
+    "very_short_workout",
+    "possible_incomplete_workout",
+    "implausible_average_speed",
+    "implausible_max_speed",
+}
+
+
+def _workout_is_baseline_eligible(workout: dict[str, Any]) -> bool:
+    return not bool(_BASELINE_BLOCKING_WORKOUT_FLAGS.intersection(workout.get("quality_flags", [])))
+
+
 def _workout_averages(workouts: list[dict[str, Any]]) -> dict[str, float | None]:
-    baseline_blocking_flags = {
-        "distance_too_low_for_reliable_pace",
-        "very_short_workout",
-        "possible_incomplete_workout",
-        "implausible_average_speed",
-        "implausible_max_speed",
-    }
-    eligible = [
-        item
-        for item in workouts
-        if not baseline_blocking_flags.intersection(item.get("quality_flags", []))
-    ]
+    eligible = [item for item in workouts if _workout_is_baseline_eligible(item)]
     return {
         "eligible_workouts": len(eligible),
         "duration_minutes": _round(_mean([_number(item.get("duration_minutes")) for item in eligible]), 1),
         "distance_km": _round(_mean([_number(item.get("distance_km")) for item in eligible]), 3),
-        "active_energy_kcal": _round(
-            _mean([_number(item.get("active_energy_kcal")) for item in eligible]), 1
-        ),
+        "active_energy_kcal": _round(_mean([_number(item.get("active_energy_kcal")) for item in eligible]), 1),
         "average_heart_rate_bpm": _round(
-            _mean([_number(item.get("heart_rate_bpm", {}).get("average")) for item in eligible]), 1
+            _mean([_number(item.get("heart_rate_bpm", {}).get("average")) for item in eligible]),
+            1,
         ),
         "average_speed_kmh": _round(_mean([_number(item.get("average_speed_kmh")) for item in eligible]), 2),
-        "pace_minutes_per_km": _round(
-            _mean([_number(item.get("pace_minutes_per_km")) for item in eligible]), 2
-        ),
+        "pace_minutes_per_km": _round(_mean([_number(item.get("pace_minutes_per_km")) for item in eligible]), 2),
         "elevation_gain_m": _round(_mean([_number(item.get("elevation_gain_m")) for item in eligible]), 1),
     }
 
@@ -1455,13 +1496,16 @@ def _workout_type_stats(workouts: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "eligible_for_baseline": averages.pop("eligible_workouts"),
                 "totals": {
                     "duration_minutes": _round(
-                        _sum_optional([_number(item.get("duration_minutes")) for item in items]), 1
+                        _sum_optional([_number(item.get("duration_minutes")) for item in items]),
+                        1,
                     ),
                     "active_energy_kcal": _round(
-                        _sum_optional([_number(item.get("active_energy_kcal")) for item in items]), 1
+                        _sum_optional([_number(item.get("active_energy_kcal")) for item in items]),
+                        1,
                     ),
                     "distance_km": _round(
-                        _sum_optional([_number(item.get("distance_km")) for item in items]), 3
+                        _sum_optional([_number(item.get("distance_km")) for item in items]),
+                        3,
                     ),
                 },
                 "same_type_averages": averages,
@@ -1489,7 +1533,12 @@ def _metric_differences(
 ) -> dict[str, Any]:
     target_values = _workout_metric_values(target)
     if not include_type_specific:
-        for metric in ("distance_km", "average_speed_kmh", "pace_minutes_per_km", "elevation_gain_m"):
+        for metric in (
+            "distance_km",
+            "average_speed_kmh",
+            "pace_minutes_per_km",
+            "elevation_gain_m",
+        ):
             target_values.pop(metric, None)
     result: dict[str, Any] = {}
     for metric, target_value in target_values.items():
@@ -1510,6 +1559,15 @@ def _metric_differences(
 
 def _workout_highlights(workout: dict[str, Any], baseline_count: int | None = None) -> list[str]:
     highlights: list[str] = []
+    quality_flags = set(workout.get("quality_flags", []))
+    if "possible_incomplete_workout" in quality_flags:
+        highlights.append("本次锻炼记录很短且可能仍在上传，不生成表现比较")
+    elif "very_short_workout" in quality_flags:
+        highlights.append("本次锻炼记录时间过短，不生成表现比较")
+    if "distance_too_low_for_reliable_pace" in quality_flags:
+        highlights.append("距离覆盖不足，配速和平均速度已隐藏")
+    if {"implausible_average_speed", "implausible_max_speed"}.intersection(quality_flags):
+        highlights.append("速度数据异常，相关速度指标已隐藏")
     duration = _number(workout.get("duration_minutes"))
     distance = _number(workout.get("distance_km"))
     if duration is not None:
@@ -1531,6 +1589,31 @@ def _workout_highlights(workout: dict[str, Any], baseline_count: int | None = No
     return highlights[:3]
 
 
+_WORKOUT_TYPE_FAMILIES = {
+    "cycling": ("cycling", "cycle", "bike", "biking", "ride", "骑行", "自行车"),
+    "walking": ("walking", "walk", "步行"),
+    "running": ("running", "run", "跑步", "跑"),
+    "strength": ("strength", "gym", "力量", "力量训练", "健身"),
+}
+
+
+def _matches_workout_type(actual: str | None, requested: str | None) -> bool:
+    if not requested:
+        return True
+    actual_normalized = " ".join(str(actual or "").casefold().split())
+    requested_normalized = " ".join(requested.casefold().split())
+    if actual_normalized == requested_normalized:
+        return True
+    for aliases in _WORKOUT_TYPE_FAMILIES.values():
+        if requested_normalized in aliases:
+            return any(alias in actual_normalized for alias in aliases)
+    return requested_normalized in actual_normalized
+
+
+def _normalized_workout_type(value: Any) -> str:
+    return " ".join(str(value or "").casefold().split())
+
+
 def list_workouts(
     db_path: Path,
     days: int = 7,
@@ -1547,15 +1630,13 @@ def list_workouts(
         raise ValueError("limit must be between 1 and 50")
     zone = _zone(timezone)
     end_day = _parse_date(end_date) if end_date else datetime.now(zone).date()
+    _validate_not_future(end_day, zone, "end_date")
     start_day = end_day - timedelta(days=days - 1)
     start, _ = _day_bounds(start_day, zone)
     _, end = _day_bounds(end_day, zone)
-    workouts = [
-        _workout_summary(row, zone, output_format == "detailed")
-        for row in _workout_rows(db_path, start, end)
-    ]
+    workouts = [_workout_summary(row, zone, output_format == "detailed") for row in _workout_rows(db_path, start, end)]
     if workout_type:
-        workouts = [item for item in workouts if str(item.get("type", "")).casefold() == workout_type.casefold()]
+        workouts = [item for item in workouts if _matches_workout_type(item.get("type"), workout_type)]
     matching_workout_count = len(workouts)
     workouts = workouts[:limit]
     truncated = matching_workout_count > len(workouts)
@@ -1563,7 +1644,7 @@ def list_workouts(
     previous_start = start - timedelta(days=days)
     previous = [_workout_summary(row, zone) for row in _workout_rows(db_path, previous_start, start)]
     if workout_type:
-        previous = [item for item in previous if str(item.get("type", "")).casefold() == workout_type.casefold()]
+        previous = [item for item in previous if _matches_workout_type(item.get("type"), workout_type)]
     type_stats = _workout_type_stats(workouts)
     baseline_by_type: list[dict[str, Any]] = []
     for stats in type_stats:
@@ -1584,44 +1665,37 @@ def list_workouts(
     sources = sorted({str(item["source"]) for item in workouts if item.get("source")})
     quality = [item.pop("_quality") for item in workouts]
     semantic_complete = (
-        bool(workouts)
-        and all(item["complete"] and not item["quality_flags"] for item in quality)
-        and not truncated
+        bool(workouts) and all(item["complete"] and not item["quality_flags"] for item in quality) and not truncated
     )
     workout_dates = sorted({str(item["start"])[:10] for item in workouts if item.get("start")})
     summary = {
         "workout_count": len(workouts),
         "workout_days": len(workout_dates),
         "totals": {
-            "duration_minutes": _round(_sum_optional([_number(item.get("duration_minutes")) for item in workouts]), 1),
+            "duration_minutes": _round(
+                _sum_optional([_number(item.get("duration_minutes")) for item in workouts]),
+                1,
+            ),
             "active_energy_kcal": _round(
-                _sum_optional([_number(item.get("active_energy_kcal")) for item in workouts]), 1
+                _sum_optional([_number(item.get("active_energy_kcal")) for item in workouts]),
+                1,
             ),
         },
         "by_type": (
-            type_stats
-            if output_format == "detailed"
-            else [_compact_workout_type_stats(item) for item in type_stats]
+            type_stats if output_format == "detailed" else [_compact_workout_type_stats(item) for item in type_stats]
         ),
         "workouts": (
-            workouts
-            if output_format == "detailed"
-            else [_compact_workout_list_item(item) for item in workouts]
+            workouts if output_format == "detailed" else [_compact_workout_list_item(item) for item in workouts]
         ),
     }
     status = "empty" if not workouts else "ok" if semantic_complete else "partial"
     highlights = (
-        [
-            f"请求范围内找到{matching_workout_count}次锻炼，"
-            f"当前返回{len(workouts)}次，覆盖{len(workout_dates)}天"
-        ]
+        [f"请求范围内找到{matching_workout_count}次锻炼，当前返回{len(workouts)}次，覆盖{len(workout_dates)}天"]
         if workouts
         else ["请求范围内没有已上传的锻炼"]
     )
     if type_stats:
-        highlights.append(
-            "锻炼类型：" + "、".join(f"{item['type']}{item['count']}次" for item in type_stats)
-        )
+        highlights.append("锻炼类型：" + "、".join(f"{item['type']}{item['count']}次" for item in type_stats))
     coverage = {
         "complete": None,
         "workout_days": len(workout_dates),
@@ -1656,7 +1730,10 @@ def list_workouts(
             "limit": limit,
         },
         "actual_data_range": (
-            {"start": workouts[-1]["start"], "end": workouts[0].get("end") or workouts[0]["start"]}
+            {
+                "start": workouts[-1]["start"],
+                "end": workouts[0].get("end") or workouts[0]["start"],
+            }
             if workouts
             else None
         ),
@@ -1708,8 +1785,11 @@ def get_workout_detail(
             "requested_range": {"workout_id": workout_id},
             "actual_data_range": None,
             "summary": {},
-            "comparison_to_personal_baseline": {"baseline_workouts": 0, "strength": "insufficient_data"},
-            "highlights": ["未找到该workout_id；请先调用AppleHealth:list_workouts获取有效ID"],
+            "comparison_to_personal_baseline": {
+                "baseline_workouts": 0,
+                "strength": "insufficient_data",
+            },
+            "highlights": ["未找到该workout_id；请先调用list_workouts获取有效ID"],
             "fetch": {"complete": True},
             "coverage": coverage,
             "period": {"is_closed": None, "may_still_update": None},
@@ -1718,7 +1798,11 @@ def get_workout_detail(
                 complete=False,
                 coverage=coverage,
                 latest_ingestion=_latest_ingestion(db_path, zone),
-                details={"sources": [], "derived_fields": [], "missing_fields": ["workout_id"]},
+                details={
+                    "sources": [],
+                    "derived_fields": [],
+                    "missing_fields": ["workout_id"],
+                },
             ),
         }
         if output_format == "detailed":
@@ -1728,22 +1812,34 @@ def get_workout_detail(
     quality = workout.pop("_quality")
     target_start = _parse_datetime(rows[0].get("start_time"))
     prior_rows = _workout_rows(db_path, end=target_start) if target_start else []
-    prior = [
+    prior_candidates = [
         _workout_summary(row, zone)
         for row in prior_rows
-        if str(row.get("event_type", "")).casefold() == str(workout.get("type", "")).casefold()
-    ][:5]
+        if _normalized_workout_type(row.get("event_type")) == _normalized_workout_type(workout.get("type"))
+    ]
+    excluded_prior_count = len([item for item in prior_candidates if not _workout_is_baseline_eligible(item)])
+    prior = [item for item in prior_candidates if _workout_is_baseline_eligible(item)][:5]
     baseline = _workout_averages(prior)
     eligible_baseline = int(baseline.pop("eligible_workouts"))
     for item in prior:
         item.pop("_quality", None)
     semantic_complete = quality["complete"] and not quality["quality_flags"]
+    comparison_performed = quality["baseline_eligible"] and eligible_baseline >= 3
+    comparison_suppressed_reason = (
+        None
+        if comparison_performed
+        else "target_workout_quality"
+        if not quality["baseline_eligible"]
+        else "insufficient_same_type_baseline"
+    )
     full_comparison = {
         "baseline_type": "previous_same_type_workouts",
         "baseline_workouts": eligible_baseline,
-        "excluded_baseline_workouts": len(prior) - eligible_baseline,
-        "baseline_average": baseline,
-        "metric_comparison": _metric_differences(workout, baseline),
+        "excluded_baseline_workouts": excluded_prior_count,
+        "baseline_average": baseline if comparison_performed else {},
+        "metric_comparison": _metric_differences(workout, baseline) if comparison_performed else {},
+        "comparison_performed": comparison_performed,
+        "suppressed_reason": comparison_suppressed_reason,
         "strength": _strength(eligible_baseline),
     }
     start_date = _parse_datetime(rows[0].get("start_time"))
@@ -1754,13 +1850,16 @@ def get_workout_detail(
         "timezone": zone.key,
         "requested_range": {"workout_id": workout_id},
         "actual_data_range": {"start": workout["start"], "end": workout["end"]},
-        "summary": {
-            "workout": workout if output_format == "detailed" else _compact_workout(workout)
-        },
+        "summary": {"workout": workout if output_format == "detailed" else _compact_workout(workout)},
         "comparison_to_personal_baseline": (
             full_comparison
             if output_format == "detailed"
-            else {"baseline_workouts": eligible_baseline, "strength": _strength(eligible_baseline)}
+            else {
+                "baseline_workouts": eligible_baseline,
+                "strength": _strength(eligible_baseline),
+                "comparison_performed": comparison_performed,
+                "suppressed_reason": comparison_suppressed_reason,
+            }
         ),
         "highlights": _workout_highlights(workout, eligible_baseline),
         "fetch": {"complete": True},
@@ -1805,25 +1904,38 @@ def compare_workouts(
 
     comparison_type = "specific_workout" if comparison_workout_id else "previous_same_type_workouts"
     comparison_workouts: list[dict[str, Any]] = []
+    excluded_baseline_workouts = 0
     if comparison_workout_id:
         comparison_rows = _workout_rows(db_path, workout_id=comparison_workout_id)
         if not comparison_rows:
-            raise ValueError(
-                "comparison_workout_id was not found; call list_workouts to obtain a valid workout ID"
-            )
-        comparison_workouts = [
-            _workout_summary(comparison_rows[0], zone, output_format == "detailed")
-        ]
+            raise ValueError("comparison_workout_id was not found; call list_workouts to obtain a valid workout ID")
+        comparison_workouts = [_workout_summary(comparison_rows[0], zone, output_format == "detailed")]
     else:
         target_start = _parse_datetime(rows[0].get("start_time"))
         prior_rows = _workout_rows(db_path, end=target_start) if target_start else []
-        comparison_workouts = [
+        comparison_candidates = [
             _workout_summary(row, zone, output_format == "detailed")
             for row in prior_rows
-            if str(row.get("event_type", "")).casefold() == str(target.get("type", "")).casefold()
-        ][:baseline_count]
+            if _normalized_workout_type(row.get("event_type")) == _normalized_workout_type(target.get("type"))
+        ]
+        excluded_baseline_workouts = len(
+            [item for item in comparison_candidates if not _workout_is_baseline_eligible(item)]
+        )
+        comparison_workouts = [item for item in comparison_candidates if _workout_is_baseline_eligible(item)][
+            :baseline_count
+        ]
     comparison_quality = [item.pop("_quality") for item in comparison_workouts]
-    same_type = all(item.get("type") == target.get("type") for item in comparison_workouts)
+    same_type = all(
+        _normalized_workout_type(item.get("type")) == _normalized_workout_type(target.get("type"))
+        for item in comparison_workouts
+    )
+    if comparison_workout_id and not same_type:
+        comparison_type_name = comparison_workouts[0].get("type") if comparison_workouts else None
+        raise ValueError(
+            "comparison_workout_id must have the same workout type as workout_id; "
+            f"received {target.get('type')!r} and {comparison_type_name!r}. "
+            "Choose two IDs with the same type from list_workouts."
+        )
     if comparison_workout_id and comparison_workouts:
         baseline = _workout_metric_values(comparison_workouts[0])
         eligible_baseline = 1
@@ -1837,14 +1949,26 @@ def compare_workouts(
         and not target_quality["quality_flags"]
         and all(item["complete"] and not item["quality_flags"] for item in comparison_quality)
     )
-    enough_baseline = bool(comparison_workouts) and (
-        comparison_workout_id is not None or eligible_baseline >= 3
+    enough_baseline = bool(comparison_workouts) and (comparison_workout_id is not None or eligible_baseline >= 3)
+    comparison_quality_eligible = all(item["baseline_eligible"] for item in comparison_quality)
+    comparison_performed = target_quality["baseline_eligible"] and comparison_quality_eligible and enough_baseline
+    comparison_suppressed_reason = (
+        None
+        if comparison_performed
+        else "target_workout_quality"
+        if not target_quality["baseline_eligible"]
+        else "comparison_workout_quality"
+        if not comparison_quality_eligible
+        else "insufficient_same_type_baseline"
     )
-    status = "ok" if semantic_complete and enough_baseline else "partial"
-    highlights = _workout_highlights(
-        target, None if comparison_workout_id else eligible_baseline
-    )
-    if comparison_workout_id:
+    status = "ok" if semantic_complete and comparison_performed else "partial"
+    highlights = _workout_highlights(target, None if comparison_workout_id else eligible_baseline)
+    if not comparison_performed and comparison_suppressed_reason in {
+        "target_workout_quality",
+        "comparison_workout_quality",
+    }:
+        highlights.insert(1 if highlights else 0, "记录质量不足，未生成精确表现差异")
+    elif comparison_workout_id:
         highlights.append("已与指定的另一场锻炼进行机械指标比较")
     elif comparison_workouts:
         highlights.append(f"已与此前{eligible_baseline}次合格同类锻炼的个人均值比较")
@@ -1852,11 +1976,17 @@ def compare_workouts(
         highlights.append("没有更早的同类锻炼可用于比较")
     actual_starts = [item.get("start") for item in [target, *comparison_workouts] if item.get("start")]
     quality_items = [target_quality, *comparison_quality]
-    differences = _metric_differences(target, baseline, include_type_specific=same_type)
+    differences = _metric_differences(target, baseline, include_type_specific=same_type) if comparison_performed else {}
     concise_differences = {
         key: value
         for key, value in differences.items()
-        if key in {"duration_minutes", "distance_km", "active_energy_kcal", "average_heart_rate_bpm"}
+        if key
+        in {
+            "duration_minutes",
+            "distance_km",
+            "active_energy_kcal",
+            "average_heart_rate_bpm",
+        }
         and (value.get("target") is not None or value.get("baseline") is not None)
     }
     target_start = _parse_datetime(rows[0].get("start_time"))
@@ -1870,20 +2000,26 @@ def compare_workouts(
         "target_workout": target if output_format == "detailed" else _compact_workout(target),
         "comparison_type": comparison_type,
         "comparison_workouts": (
-            comparison_workouts
-            if output_format == "detailed"
-            else [_compact_workout(item) for item in comparison_workouts]
+            (
+                comparison_workouts
+                if output_format == "detailed"
+                else [_compact_workout(item) for item in comparison_workouts]
+            )
+            if comparison_performed
+            else []
         ),
         "metric_comparison": differences if output_format == "detailed" else concise_differences,
+        "comparison_performed": comparison_performed,
+        "comparison_suppressed_reason": comparison_suppressed_reason,
     }
     full_comparison = {
         "baseline_type": comparison_type,
         "same_workout_type": same_type,
         "baseline_workouts": eligible_baseline,
-        "excluded_baseline_workouts": (
-            0 if comparison_workout_id else len(comparison_workouts) - eligible_baseline
-        ),
-        "baseline_average": baseline,
+        "excluded_baseline_workouts": excluded_baseline_workouts,
+        "baseline_average": baseline if comparison_performed else {},
+        "comparison_performed": comparison_performed,
+        "suppressed_reason": comparison_suppressed_reason,
         "strength": strength,
     }
     response: dict[str, Any] = {
@@ -1894,14 +2030,17 @@ def compare_workouts(
             "comparison_workout_id": comparison_workout_id,
             "baseline_count": baseline_count,
         },
-        "actual_data_range": (
-            {"start": min(actual_starts), "end": max(actual_starts)} if actual_starts else None
-        ),
+        "actual_data_range": ({"start": min(actual_starts), "end": max(actual_starts)} if actual_starts else None),
         "summary": summary,
         "comparison_to_personal_baseline": (
             full_comparison
             if output_format == "detailed"
-            else {"baseline_workouts": eligible_baseline, "strength": strength}
+            else {
+                "baseline_workouts": eligible_baseline,
+                "strength": strength,
+                "comparison_performed": comparison_performed,
+                "suppressed_reason": comparison_suppressed_reason,
+            }
         ),
         "highlights": highlights[:3],
         "fetch": {"complete": True},
@@ -1948,34 +2087,35 @@ def _activity_baseline(
         snapshot["activity"]
         for snapshot in snapshots
         if snapshot["quality"]["baseline_eligible"]
-        and any(
-            value is not None
-            for key, value in snapshot["activity"].items()
-            if key != "date"
-        )
+        and any(value is not None for key, value in snapshot["activity"].items() if key != "date")
     ]
     excluded_dates = [
         snapshot["activity"]["date"]
         for snapshot in snapshots
-        if any(
-            value is not None
-            for key, value in snapshot["activity"].items()
-            if key != "date"
-        )
+        if any(value is not None for key, value in snapshot["activity"].items() if key != "date")
         and not snapshot["quality"]["baseline_eligible"]
     ]
+    metric_sample_days = {
+        "step_count": len([item for item in valid if item["step_count"] is not None]),
+        "walking_running_distance_km": len([item for item in valid if item["walking_running_distance_km"] is not None]),
+        "active_energy_kcal": len([item for item in valid if item["active_energy_kcal"] is not None]),
+        "exercise_minutes": len([item for item in valid if item["exercise_minutes"] is not None]),
+    }
+    available_metric_counts = [count for count in metric_sample_days.values() if count > 0]
     baseline = {
         "baseline_days": len(valid),
         "baseline_window": f"previous_{lookback_days}_days",
         "excluded_days": len(excluded_dates),
         "excluded_dates": excluded_dates,
+        "metric_sample_days": metric_sample_days,
+        "metric_strength": {name: _strength(count) for name, count in metric_sample_days.items()},
         "step_count_average": _round(_mean([_number(item["step_count"]) for item in valid]), 0),
         "walking_running_distance_km_average": _round(
             _mean([_number(item["walking_running_distance_km"]) for item in valid]), 2
         ),
         "active_energy_kcal_average": _round(_mean([_number(item["active_energy_kcal"]) for item in valid]), 1),
         "exercise_minutes_average": _round(_mean([_number(item["exercise_minutes"]) for item in valid]), 1),
-        "strength": _strength(len(valid)),
+        "strength": _strength(min(available_metric_counts) if available_metric_counts else 0),
     }
     return valid, baseline
 
@@ -1989,6 +2129,58 @@ def get_daily_activity(
     _validate_output_format(output_format)
     target = _parse_date(date)
     zone = _zone(timezone)
+    period = _period_state(target, zone)
+    if not period["has_started"]:
+        activity = {
+            "date": target.isoformat(),
+            "step_count": None,
+            "walking_running_distance_km": None,
+            "cycling_distance_km": None,
+            "active_energy_kcal": None,
+            "exercise_minutes": None,
+            "stand_minutes": None,
+            "stand_hours": None,
+            "daylight_minutes": None,
+        }
+        coverage = {"complete": False, "valid_days": 0, "missing_days": 1}
+        response: dict[str, Any] = {
+            "status": "empty",
+            "timezone": zone.key,
+            "requested_range": {"date": target.isoformat()},
+            "actual_data_range": None,
+            "summary": {"activity": activity, "workouts": []},
+            "comparison_to_personal_baseline": {
+                "baseline_days": 0,
+                "strength": "insufficient_data",
+                "comparison_status": "suppressed",
+                "suppressed_reason": "future_period",
+            },
+            "highlights": ["请求日期尚未开始，没有可查询的活动数据"],
+            "fetch": {"complete": True},
+            "coverage": coverage,
+            "period": period,
+            "data_quality": _quality_payload(
+                output_format,
+                complete=False,
+                coverage=coverage,
+                latest_ingestion=_latest_ingestion(db_path, zone),
+                details={
+                    "sources": [],
+                    "derived_fields": [],
+                    "missing_fields": [key for key in activity if key != "date"],
+                },
+            ),
+        }
+        response["data_quality"].update(
+            {
+                "baseline_eligible": False,
+                "quality_flags": ["future_period"],
+                "comparison_status": "suppressed",
+            }
+        )
+        if output_format == "detailed":
+            response["capabilities"] = capabilities(db_path)
+        return response
     snapshot = _activity_day_snapshot(db_path, target, zone)
     activity = snapshot["activity"]
     activity_quality = snapshot["quality"]
@@ -1996,15 +2188,43 @@ def get_daily_activity(
     valid_fields = [key for key, value in activity.items() if key != "date" and value is not None]
     missing_fields = [key for key, value in activity.items() if key != "date" and value is None]
     _, baseline = _activity_baseline(db_path, target, zone)
+    comparable_baseline_counts = [
+        baseline["metric_sample_days"][name]
+        for name, value in (
+            ("step_count", activity["step_count"]),
+            ("active_energy_kcal", activity["active_energy_kcal"]),
+        )
+        if value is not None
+    ]
+    baseline_ready = bool(comparable_baseline_counts) and all(count >= 3 for count in comparable_baseline_counts)
+    comparison_suppressed = not period["is_closed"] or not activity_quality["baseline_eligible"] or not baseline_ready
     comparison = dict(baseline)
+    comparison["comparison_status"] = "suppressed" if comparison_suppressed else "available"
+    comparison["suppressed_reason"] = (
+        "future_period"
+        if not period["has_started"]
+        else "current_period_open"
+        if not period["is_closed"]
+        else "activity_quality_not_baseline_eligible"
+        if not activity_quality["baseline_eligible"]
+        else "insufficient_personal_baseline"
+        if not baseline_ready
+        else None
+    )
     comparison["step_count_difference"] = (
         round(activity["step_count"] - baseline["step_count_average"])
-        if activity["step_count"] is not None and baseline["step_count_average"] is not None
+        if not comparison_suppressed
+        and baseline["metric_sample_days"]["step_count"] >= 3
+        and activity["step_count"] is not None
+        and baseline["step_count_average"] is not None
         else None
     )
     comparison["active_energy_difference_kcal"] = (
         _round(activity["active_energy_kcal"] - baseline["active_energy_kcal_average"], 1)
-        if activity["active_energy_kcal"] is not None and baseline["active_energy_kcal_average"] is not None
+        if not comparison_suppressed
+        and baseline["metric_sample_days"]["active_energy_kcal"] >= 3
+        and activity["active_energy_kcal"] is not None
+        and baseline["active_energy_kcal_average"] is not None
         else None
     )
     summary: dict[str, Any] = {"activity": activity, "workouts": workouts}
@@ -2018,24 +2238,22 @@ def get_daily_activity(
             "stand_hours": "count",
             "daylight_minutes": "min",
         }
-    period = _period_state(target, zone)
     semantic_complete = (
-        bool(valid_fields)
-        and not missing_fields
-        and period["is_closed"]
-        and activity_quality["baseline_eligible"]
+        bool(valid_fields) and not missing_fields and period["is_closed"] and activity_quality["baseline_eligible"]
     )
     status = "empty" if not valid_fields else "ok" if semantic_complete else "partial"
     highlights: list[str] = []
+    if not period["has_started"]:
+        highlights.append("请求日期尚未开始，没有可查询的活动数据")
     if activity_quality["contaminated_metrics"]:
         highlights.append("活动数据发现重复来源，已去重但暂不用于个人基线判断")
-    if activity["step_count"] is not None:
+    if activity["step_count"] is not None and period["has_started"]:
         highlights.append(f"去重后当天记录约{activity['step_count']}步")
-    if activity["exercise_minutes"] is not None:
+    if activity["exercise_minutes"] is not None and period["has_started"]:
         highlights.append(f"锻炼时间约{activity['exercise_minutes']}分钟")
-    if not period["is_closed"]:
+    if period["state"] == "in_progress":
         highlights.append("当天尚未结束，活动数据可能继续更新")
-    if not workouts:
+    if not workouts and period["has_started"]:
         highlights.append("当前未上传可关联的锻炼会话")
     sources = sorted(
         {
@@ -2058,7 +2276,12 @@ def get_daily_activity(
         "comparison_to_personal_baseline": (
             comparison
             if output_format == "detailed"
-            else {"baseline_days": baseline["baseline_days"], "strength": baseline["strength"]}
+            else {
+                "baseline_days": baseline["baseline_days"],
+                "strength": baseline["strength"],
+                "comparison_status": comparison["comparison_status"],
+                "suppressed_reason": comparison["suppressed_reason"],
+            }
         ),
         "highlights": highlights[:3],
         "fetch": {"complete": True},
@@ -2078,12 +2301,31 @@ def get_daily_activity(
     }
     response["data_quality"].update(
         {
-            "deduplication": activity_quality["deduplication"],
-            "aggregation": activity_quality["aggregation"],
-            "baseline_eligible": activity_quality["baseline_eligible"],
-            "contaminated_metrics": activity_quality["contaminated_metrics"],
+            "baseline_eligible": not comparison_suppressed,
+            "quality_flags": [
+                flag
+                for flag, present in (
+                    (
+                        "duplicate_sources",
+                        bool(activity_quality["contaminated_metrics"]),
+                    ),
+                    ("current_period_open", period["state"] == "in_progress"),
+                    ("future_period", not period["has_started"]),
+                )
+                if present
+            ],
+            "comparison_status": comparison["comparison_status"],
         }
     )
+    if output_format == "detailed":
+        response["data_quality"].update(
+            {
+                "deduplication": _compact_deduplication(activity_quality),
+                "aggregation": activity_quality["aggregation"],
+                "contaminated_metrics": activity_quality["contaminated_metrics"],
+                "comparison_suppressed_reason": comparison["suppressed_reason"],
+            }
+        )
     if output_format == "detailed":
         response["capabilities"] = capabilities(db_path)
     return response
@@ -2101,20 +2343,19 @@ def get_activity_trend(
         raise ValueError("days must be one of 7, 14, or 30")
     zone = _zone(timezone)
     end = _parse_date(end_date) if end_date else datetime.now(zone).date()
+    _validate_not_future(end, zone, "end_date")
     start = end - timedelta(days=days - 1)
     requested_days = _date_range(start, end)
     snapshots = [_activity_day_snapshot(db_path, day, zone) for day in requested_days]
+    period = _period_state(end, zone)
     daily = [snapshot["activity"] for snapshot in snapshots]
     valid = [item for item in daily if any(value is not None for key, value in item.items() if key != "date")]
     trusted = [
         snapshot["activity"]
         for snapshot in snapshots
         if snapshot["quality"]["baseline_eligible"]
-        and any(
-            value is not None
-            for key, value in snapshot["activity"].items()
-            if key != "date"
-        )
+        and snapshot["activity"]["date"] < datetime.now(zone).date().isoformat()
+        and any(value is not None for key, value in snapshot["activity"].items() if key != "date")
     ]
     missing = days - len(valid)
     previous_start = start - timedelta(days=days)
@@ -2124,18 +2365,15 @@ def get_activity_trend(
         snapshot["activity"]
         for snapshot in previous_snapshots
         if snapshot["quality"]["baseline_eligible"]
-        and any(
-            value is not None
-            for key, value in snapshot["activity"].items()
-            if key != "date"
-        )
+        and any(value is not None for key, value in snapshot["activity"].items() if key != "date")
     ]
 
     def averages(items: list[dict[str, Any]]) -> dict[str, float | None]:
         return {
             "step_count": _round(_mean([_number(item["step_count"]) for item in items]), 0),
             "walking_running_distance_km": _round(
-                _mean([_number(item["walking_running_distance_km"]) for item in items]), 2
+                _mean([_number(item["walking_running_distance_km"]) for item in items]),
+                2,
             ),
             "active_energy_kcal": _round(_mean([_number(item["active_energy_kcal"]) for item in items]), 1),
             "exercise_minutes": _round(_mean([_number(item["exercise_minutes"]) for item in items]), 1),
@@ -2158,17 +2396,17 @@ def get_activity_trend(
             if trend_values
             else None,
             "walking_running_distance_km": _round(
-                _sum_optional([_number(item["walking_running_distance_km"]) for item in trend_values]), 2
+                _sum_optional([_number(item["walking_running_distance_km"]) for item in trend_values]),
+                2,
             ),
             "active_energy_kcal": _round(
-                _sum_optional([_number(item["active_energy_kcal"]) for item in trend_values]), 1
+                _sum_optional([_number(item["active_energy_kcal"]) for item in trend_values]),
+                1,
             ),
             "exercise_minutes": round(_sum_optional([_number(item["exercise_minutes"]) for item in trend_values]) or 0)
             if trend_values
             else None,
-            "stand_minutes": round(
-                _sum_optional([_number(item["stand_minutes"]) for item in trend_values]) or 0
-            )
+            "stand_minutes": round(_sum_optional([_number(item["stand_minutes"]) for item in trend_values]) or 0)
             if trend_values
             else None,
         },
@@ -2186,16 +2424,24 @@ def get_activity_trend(
         ),
         "strength": _strength(len(previous_valid)),
     }
-    period = _period_state(end, zone)
     excluded_current_days = len(valid) - len(trusted)
-    semantic_complete = missing == 0 and period["is_closed"] and excluded_current_days == 0
+    semantic_complete = missing == 0 and period["is_closed"] and excluded_current_days == 0 and len(trusted) >= 3
     status = "empty" if not valid else "ok" if semantic_complete else "partial"
     highlights: list[str] = []
-    if excluded_current_days:
-        highlights.append(
-            f"{excluded_current_days}天活动数据存在重复来源，已从趋势和个人基线中排除"
-        )
-    if 0 < len(trusted) < 3:
+    contaminated_dates = [
+        snapshot["activity"]["date"] for snapshot in snapshots if snapshot["quality"]["contaminated_metrics"]
+    ]
+    open_dates = [
+        snapshot["activity"]["date"]
+        for snapshot in snapshots
+        if snapshot["activity"]["date"] == datetime.now(zone).date().isoformat()
+        and any(value is not None for key, value in snapshot["activity"].items() if key != "date")
+    ]
+    if contaminated_dates:
+        highlights.append(f"{len(contaminated_dates)}天活动数据存在重复来源，已从趋势和个人基线中排除")
+    if open_dates:
+        highlights.append("当前自然日尚未结束，已从趋势平均和个人基线中排除")
+    if len(trusted) < 3:
         highlights.append(f"仅有{len(trusted)}个可信日，暂不生成活动趋势")
     if current_average["step_count"] is not None:
         highlights.append(f"{len(trusted)}个可信日平均约{round(current_average['step_count'])}步")
@@ -2214,31 +2460,32 @@ def get_activity_trend(
         }
     )
     raw_rows = sum(snapshot["quality"]["deduplication"]["raw_rows"] for snapshot in snapshots)
-    unique_rows = sum(
-        snapshot["quality"]["deduplication"]["unique_rows"] for snapshot in snapshots
-    )
-    duplicates_removed = sum(
-        snapshot["quality"]["deduplication"]["duplicates_removed"]
-        for snapshot in snapshots
-    )
-    contaminated_dates = [
-        snapshot["activity"]["date"]
-        for snapshot in snapshots
-        if snapshot["quality"]["contaminated_metrics"]
-    ]
-    coverage = {"complete": missing == 0, "valid_days": len(valid), "missing_days": missing}
+    unique_rows = sum(snapshot["quality"]["deduplication"]["unique_rows"] for snapshot in snapshots)
+    duplicates_removed = sum(snapshot["quality"]["deduplication"]["duplicates_removed"] for snapshot in snapshots)
+    coverage = {
+        "complete": missing == 0,
+        "valid_days": len(valid),
+        "missing_days": missing,
+    }
     response: dict[str, Any] = {
         "status": status,
         "timezone": zone.key,
-        "requested_range": {"start_date": start.isoformat(), "end_date": end.isoformat(), "days": days},
-        "actual_data_range": (
-            {"start_date": valid[0]["date"], "end_date": valid[-1]["date"]} if valid else None
-        ),
+        "requested_range": {
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+            "days": days,
+        },
+        "actual_data_range": ({"start_date": valid[0]["date"], "end_date": valid[-1]["date"]} if valid else None),
         "summary": summary,
         "comparison_to_personal_baseline": (
             comparison
             if output_format == "detailed"
-            else {"baseline_days": len(previous_valid), "strength": comparison["strength"]}
+            else {
+                "baseline_days": len(previous_valid),
+                "strength": comparison["strength"],
+                "window": comparison["baseline_window"],
+                "current_trusted_days": len(trusted),
+            }
         ),
         "highlights": highlights[:3],
         "fetch": {"complete": True},
@@ -2251,36 +2498,48 @@ def get_activity_trend(
             latest_ingestion=_latest_ingestion(db_path, zone),
             details={
                 "sources": sources,
-                "derived_fields": ["summary.daily_average", "summary.period_totals.active_energy_kcal"],
+                "derived_fields": [
+                    "summary.daily_average",
+                    "summary.period_totals.active_energy_kcal",
+                ],
                 "missing_fields": [],
             },
         ),
     }
     response["data_quality"].update(
         {
-            "deduplication": {
-                "applied": True,
-                "raw_rows": raw_rows,
-                "unique_rows": unique_rows,
-                "duplicates_removed": duplicates_removed,
-                "duplicate_ratio": (
-                    round(duplicates_removed / raw_rows, 4) if raw_rows else 0.0
-                ),
-                "method": "stable_record_fingerprint_then_source_priority_overlap",
-            },
-            "aggregation": {
-                "timezone": zone.key,
-                "method": "deduplicated_exported_interval_sum",
-                "authoritative_healthkit_daily_total": None,
-            },
-            "baseline_eligible": excluded_current_days == 0,
+            "baseline_eligible": excluded_current_days == 0 and len(trusted) >= 3,
+            "quality_flags": [
+                flag
+                for flag, present in (
+                    ("duplicate_sources", bool(contaminated_dates)),
+                    ("current_period_open", bool(open_dates)),
+                )
+                if present
+            ],
             "contaminated_dates": contaminated_dates,
+            "open_dates": open_dates,
         }
     )
     if output_format == "detailed":
-        response["data_quality"]["by_day"] = {
-            snapshot["activity"]["date"]: snapshot["quality"] for snapshot in snapshots
-        }
+        response["data_quality"].update(
+            {
+                "deduplication": {
+                    "applied": True,
+                    "raw_rows": raw_rows,
+                    "unique_rows": unique_rows,
+                    "duplicates_removed": duplicates_removed,
+                    "duplicate_ratio": (round(duplicates_removed / raw_rows, 4) if raw_rows else 0.0),
+                    "method": "stable_record_fingerprint_then_source_priority_overlap",
+                },
+                "aggregation": {
+                    "timezone": zone.key,
+                    "method": "deduplicated_exported_interval_sum",
+                    "authoritative_healthkit_daily_total": None,
+                },
+                "contaminated_dates": contaminated_dates,
+            }
+        )
     if output_format == "detailed":
         response["capabilities"] = capabilities(db_path)
     return response
@@ -2309,7 +2568,9 @@ def _recovery_values_for_session(
     return recovery
 
 
-def _recovery_scalar_values(metrics: dict[str, dict[str, Any]]) -> dict[str, float | None]:
+def _recovery_scalar_values(
+    metrics: dict[str, dict[str, Any]],
+) -> dict[str, float | None]:
     return {name: _number(metric.get("value")) for name, metric in metrics.items()}
 
 
@@ -2322,30 +2583,49 @@ def get_recovery_snapshot(
     _validate_output_format(output_format)
     zone = _zone(timezone)
     sessions = _sleep_sessions(db_path, zone)
+    today = datetime.now(zone).date()
     if date:
         target_date = _parse_date(date).isoformat()
     else:
-        target_date = sessions[-1]["sleep_date"] if sessions else datetime.now(zone).date().isoformat()
-    session = next((item for item in sessions if item["sleep_date"] == target_date), None)
+        eligible_sessions = [item for item in sessions if _parse_date(item["sleep_date"]) <= today]
+        target_date = eligible_sessions[-1]["sleep_date"] if eligible_sessions else today.isoformat()
+    target_period = _period_state(_parse_date(target_date), zone)
+    session = (
+        next((item for item in sessions if item["sleep_date"] == target_date), None)
+        if target_period["has_started"]
+        else None
+    )
     if session is None:
         coverage = {"complete": False, "valid_nights": 0, "missing_nights": 1}
+        period_state = target_period
         response: dict[str, Any] = {
             "status": "empty",
             "timezone": zone.key,
             "requested_range": {"date": target_date},
             "actual_data_range": None,
             "summary": {},
-            "comparison_to_personal_baseline": {"baseline_nights": 0, "strength": "insufficient_data"},
-            "highlights": ["该日期没有可用于恢复快照的睡眠记录"],
+            "comparison_to_personal_baseline": {
+                "baseline_nights": 0,
+                "strength": "insufficient_data",
+            },
+            "highlights": [
+                "该日期尚未开始，没有可用于恢复快照的睡眠记录"
+                if not period_state["has_started"]
+                else "该日期没有可用于恢复快照的睡眠记录"
+            ],
             "fetch": {"complete": True},
             "coverage": coverage,
-            "period": _period_state(_parse_date(target_date), zone),
+            "period": period_state,
             "data_quality": _quality_payload(
                 output_format,
                 complete=False,
                 coverage=coverage,
                 latest_ingestion=_latest_ingestion(db_path, zone),
-                details={"sources": [], "derived_fields": [], "missing_fields": ["sleep_record"]},
+                details={
+                    "sources": [],
+                    "derived_fields": [],
+                    "missing_fields": ["sleep_record"],
+                },
             ),
         }
         if output_format == "detailed":
@@ -2355,15 +2635,19 @@ def get_recovery_snapshot(
     baseline_sessions = _sleep_baseline(sessions, target_date)
     baseline_values = [_recovery_values_for_session(db_path, item, zone) for item in baseline_sessions]
     comparisons: dict[str, Any] = {}
+    baseline_sample_counts: dict[str, int] = {}
     for key, metric in current.items():
         value = _number(metric.get("value"))
         baseline_samples = [_recovery_value(item, key) for item in baseline_values]
         baseline = _mean(baseline_samples)
+        baseline_sample_count = len([item for item in baseline_samples if item is not None])
+        baseline_sample_counts[key] = baseline_sample_count
         comparisons[key] = {
             "current": value,
             "baseline_average": _round(baseline, 1),
             "difference": _round(value - baseline, 1) if value is not None and baseline is not None else None,
-            "baseline_sample_nights": len([item for item in baseline_samples if item is not None]),
+            "baseline_sample_nights": baseline_sample_count,
+            "strength": _strength(baseline_sample_count),
         }
     missing_fields = [key for key, metric in current.items() if metric.get("value") is None]
     sleep_summary = {
@@ -2384,8 +2668,18 @@ def get_recovery_snapshot(
         highlights.append(f"总睡眠约{total // 60}小时{total % 60}分钟")
     if session.get("boundary_confidence") == "low":
         highlights.append("睡眠边界置信度低，未使用异常跨度计算整夜恢复指标")
-    baseline_strength = _strength(len(baseline_sessions))
-    if len(baseline_sessions) < 3:
+    baseline_core_metric_names = (
+        "sleeping_heart_rate_avg_bpm",
+        "hrv_near_wake_ms",
+        "respiratory_rate_avg_per_min",
+        "blood_oxygen_avg_percent",
+        "resting_heart_rate_bpm",
+    )
+    effective_baseline_nights = min(
+        [len(baseline_sessions)] + [baseline_sample_counts.get(name, 0) for name in baseline_core_metric_names]
+    )
+    baseline_strength = _strength(effective_baseline_nights)
+    if effective_baseline_nights < 3:
         highlights.append("个人基线不足，不生成恢复判断")
     if missing_fields:
         highlights.append(f"恢复指标仍缺少{len(missing_fields)}项，结果为部分数据")
@@ -2402,23 +2696,28 @@ def get_recovery_snapshot(
     semantic_complete = current_core_complete and not missing_fields
     coverage = {"complete": True, "valid_nights": 1, "missing_nights": 0}
     full_comparison = {
-        "baseline_nights": len(baseline_sessions),
+        "baseline_nights": effective_baseline_nights,
+        "sleep_baseline_nights": len(baseline_sessions),
         "strength": baseline_strength,
         "metrics": comparisons,
     }
     assessment = {
-        "status": "baseline_available" if len(baseline_sessions) >= 3 else "insufficient_baseline",
-        "baseline_nights": len(baseline_sessions),
+        "status": (
+            "current_data_partial"
+            if not semantic_complete
+            else "baseline_available"
+            if effective_baseline_nights >= 3
+            else "insufficient_baseline"
+        ),
+        "baseline_nights": effective_baseline_nights,
         "minimum_required_nights": 3,
     }
     latest_ingestion = _latest_ingestion(db_path, zone)
     ingestion_may_update = _period_state(_parse_date(target_date), zone)["may_still_update"]
     sleep_session = _sleep_session_state(session, zone)
-    status = "ok" if current_core_complete else "partial"
+    status = "ok" if semantic_complete else "partial"
     if output_format == "concise":
-        low_confidence_metrics = [
-            name for name, metric in current.items() if metric.get("confidence") == "low"
-        ]
+        low_confidence_metrics = [name for name, metric in current.items() if metric.get("confidence") == "low"]
         return {
             "status": status,
             "sleep_date": target_date,
@@ -2431,7 +2730,7 @@ def get_recovery_snapshot(
                 "low_confidence_metrics": low_confidence_metrics,
             },
             "baseline": {
-                "nights": len(baseline_sessions),
+                "nights": effective_baseline_nights,
                 "strength": baseline_strength,
             },
             "assessment": assessment,
@@ -2538,12 +2837,33 @@ def semantic_health_overview(
         raise ValueError("days must be one of 7, 14, or 30")
     zone = _zone(timezone)
     end_day = _parse_date(end_date) if end_date else datetime.now(zone).date()
+    _validate_not_future(end_day, zone, "end_date")
     start_day = end_day - timedelta(days=days - 1)
     start, _ = _day_bounds(start_day, zone)
     _, end = _day_bounds(end_day, zone)
-    activity = get_activity_trend(db_path, days, timezone, output_format=output_format, end_date=end_day.isoformat())
-    sleep = get_sleep_trend(db_path, days, timezone, output_format=output_format, end_date=end_day.isoformat())
-    recovery = get_recovery_snapshot(db_path, timezone=timezone, output_format=output_format)
+    activity = get_activity_trend(
+        db_path,
+        days,
+        timezone,
+        output_format=output_format,
+        end_date=end_day.isoformat(),
+    )
+    sleep = get_sleep_trend(
+        db_path,
+        days,
+        timezone,
+        output_format=output_format,
+        end_date=end_day.isoformat(),
+    )
+    latest_sleep = sleep.get("summary", {}).get("latest_sleep_summary") or {}
+    recovery_date = latest_sleep.get("sleep_date") or end_day.isoformat()
+    recovery = get_recovery_snapshot(
+        db_path,
+        date=recovery_date,
+        timezone=timezone,
+        output_format=output_format,
+    )
+
     def select(stats: dict[str, Any] | None, fields: tuple[str, ...]) -> dict[str, Any] | None:
         return {field: stats.get(field) for field in fields} if stats else None
 
@@ -2551,42 +2871,78 @@ def semantic_health_overview(
     resting_heart_rate = _period_stats(db_path, "resting_heart_rate", start, end, zone)
     hrv = _period_stats(db_path, "heart_rate_variability", start, end, zone, include_median=True)
     walking_heart_rate = _period_stats(db_path, "walking_heart_rate_average", start, end, zone)
+    heart_rate_selected = select(
+        heart_rate,
+        (
+            "average",
+            "minimum",
+            "maximum",
+            "latest",
+            "latest_time",
+            "unit",
+            "sample_count",
+        ),
+    )
+    if heart_rate_selected:
+        heart_rate_selected.update(
+            {
+                "aggregation_method": "unweighted_mean_of_exported_record_values",
+                "sampling_context": "opportunistic_samples_may_include_activity",
+                "interpretation": "not_a_resting_or_continuous_time_weighted_average",
+            }
+        )
     cardiovascular = {
-        "heart_rate": select(
-            heart_rate, ("average", "minimum", "maximum", "latest", "latest_time", "unit")
-        ),
+        "heart_rate": heart_rate_selected,
         "resting_heart_rate": select(
-            resting_heart_rate, ("average", "latest", "latest_time", "unit")
+            resting_heart_rate,
+            ("average", "latest", "latest_time", "unit", "sample_count"),
         ),
-        "heart_rate_variability": select(
-            hrv, ("average", "median", "latest", "latest_time", "unit")
-        ),
+        "heart_rate_variability": select(hrv, ("average", "median", "latest", "latest_time", "unit", "sample_count")),
         "walking_heart_rate_average": select(
-            walking_heart_rate, ("average", "latest", "latest_time", "unit")
+            walking_heart_rate,
+            ("average", "latest", "latest_time", "unit", "sample_count"),
         ),
     }
     respiratory_rate = _period_stats(db_path, "respiratory_rate", start, end, zone)
     oxygen = _period_stats(db_path, "blood_oxygen_saturation", start, end, zone)
     oxygen_selected = select(
-        oxygen, ("average", "minimum", "maximum", "latest", "latest_time", "unit")
+        oxygen,
+        (
+            "average",
+            "minimum",
+            "maximum",
+            "latest",
+            "latest_time",
+            "unit",
+            "sample_count",
+        ),
     )
     if oxygen_selected:
         for key in ("average", "minimum", "maximum", "latest"):
             oxygen_selected[key] = _round(_normalize_percent(_number(oxygen_selected[key])), 1)
     respiratory = {
         "respiratory_rate": select(
-            respiratory_rate, ("average", "minimum", "maximum", "latest", "latest_time", "unit")
+            respiratory_rate,
+            (
+                "average",
+                "minimum",
+                "maximum",
+                "latest",
+                "latest_time",
+                "unit",
+                "sample_count",
+            ),
         ),
         "blood_oxygen_saturation": oxygen_selected,
     }
     wrist = _period_stats(db_path, "apple_sleeping_wrist_temperature", start, end, zone)
     audio = _period_stats(db_path, "environmental_audio_exposure", start, end, zone)
-    wrist_selected = select(wrist, ("average", "latest", "latest_time", "unit"))
+    wrist_selected = select(wrist, ("average", "latest", "latest_time", "unit", "sample_count"))
     if wrist_selected:
         wrist_selected["measurement_type"] = "absolute_sleeping_wrist_temperature"
     body_environment = {
         "wrist_temperature": wrist_selected,
-        "environmental_audio_exposure": select(audio, ("average", "maximum", "latest_time", "unit")),
+        "environmental_audio_exposure": select(audio, ("average", "maximum", "latest_time", "unit", "sample_count")),
     }
     valid_days = activity["coverage"]["valid_days"]
     valid_nights = sleep["coverage"]["valid_nights"]
@@ -2629,16 +2985,10 @@ def semantic_health_overview(
                     "valid_days": activity_summary.get("valid_days"),
                     "trusted_days": activity_summary.get("trusted_days"),
                     "average_steps": activity_summary.get("daily_average", {}).get("step_count"),
-                    "average_active_energy_kcal": activity_summary.get("daily_average", {}).get(
-                        "active_energy_kcal"
-                    ),
-                    "average_exercise_minutes": activity_summary.get("daily_average", {}).get(
-                        "exercise_minutes"
-                    ),
+                    "average_active_energy_kcal": activity_summary.get("daily_average", {}).get("active_energy_kcal"),
+                    "average_exercise_minutes": activity_summary.get("daily_average", {}).get("exercise_minutes"),
                     "total_steps": activity_summary.get("period_totals", {}).get("step_count"),
-                    "total_distance_km": activity_summary.get("period_totals", {}).get(
-                        "walking_running_distance_km"
-                    ),
+                    "total_distance_km": activity_summary.get("period_totals", {}).get("walking_running_distance_km"),
                 },
                 "sleep": {
                     "valid_nights": sleep_summary.get("valid_nights"),
@@ -2649,6 +2999,8 @@ def semantic_health_overview(
                 },
                 "cardiovascular": {
                     "heart_rate_average_bpm": (heart_rate or {}).get("average"),
+                    "heart_rate_sample_count": (heart_rate or {}).get("sample_count"),
+                    "heart_rate_context": (heart_rate_selected or {}).get("interpretation"),
                     "heart_rate_latest_bpm": (heart_rate or {}).get("latest"),
                     "resting_heart_rate_latest_bpm": (resting_heart_rate or {}).get("latest"),
                     "hrv_average_ms": (hrv or {}).get("average"),
@@ -2668,16 +3020,10 @@ def semantic_health_overview(
                     {
                         "sleep_date": recovery.get("sleep_date"),
                         "total_sleep_minutes": recovery_sleep.get("total_sleep_minutes"),
-                        "sleeping_heart_rate_avg_bpm": recovery_values.get(
-                            "sleeping_heart_rate_avg_bpm"
-                        ),
+                        "sleeping_heart_rate_avg_bpm": recovery_values.get("sleeping_heart_rate_avg_bpm"),
                         "hrv_near_wake_ms": recovery_values.get("hrv_near_wake_ms"),
-                        "respiratory_rate_avg_per_min": recovery_values.get(
-                            "respiratory_rate_avg_per_min"
-                        ),
-                        "blood_oxygen_avg_percent": recovery_values.get(
-                            "blood_oxygen_avg_percent"
-                        ),
+                        "respiratory_rate_avg_per_min": recovery_values.get("respiratory_rate_avg_per_min"),
+                        "blood_oxygen_avg_percent": recovery_values.get("blood_oxygen_avg_percent"),
                         "assessment": recovery.get("assessment", {}).get("status"),
                     }
                     if recovery["status"] != "empty"
@@ -2685,7 +3031,9 @@ def semantic_health_overview(
                 ),
             },
             "baseline": {
-                "activity_strength": activity["comparison_to_personal_baseline"].get("strength"),
+                "activity_strength": _strength(activity_summary.get("trusted_days", 0)),
+                "activity_reference_strength": activity["comparison_to_personal_baseline"].get("strength"),
+                "activity_reference_window": activity["comparison_to_personal_baseline"].get("window"),
                 "sleep_strength": sleep["comparison_to_personal_baseline"].get("strength"),
                 "recovery_strength": recovery.get("baseline", {}).get("strength"),
             },
@@ -2699,17 +3047,35 @@ def semantic_health_overview(
             },
         }
 
+    overview_activity_summary = dict(activity["summary"])
+    overview_activity_summary.pop("days", None)
+    overview_sleep_summary = dict(sleep["summary"])
+    overview_sleep_summary.pop("nights", None)
+    overview_sleep_summary.pop("nightly_quality", None)
     summary: dict[str, Any] = {
-        "activity": activity["summary"],
+        "activity": overview_activity_summary,
         "cardiovascular": cardiovascular,
         "respiratory": respiratory,
-        "sleep": sleep["summary"],
+        "sleep": overview_sleep_summary,
         "body_environment": body_environment,
         "latest_recovery_snapshot": recovery["summary"] if recovery["status"] != "empty" else None,
-        "coverage_details": {
-            "activity": activity["data_quality"],
-            "sleep": sleep["data_quality"],
-            "recovery": recovery["data_quality"],
+        "domain_quality": {
+            "activity": {
+                "complete": activity["data_quality"].get("complete"),
+                "baseline_eligible": activity["data_quality"].get("baseline_eligible"),
+                "contaminated_dates": activity["data_quality"].get("contaminated_dates", []),
+            },
+            "sleep": {
+                "complete": sleep["data_quality"].get("complete"),
+                "quality_flags": sleep["data_quality"].get("quality_flags", []),
+            },
+            "recovery": {
+                "complete": recovery["data_quality"].get("complete"),
+                "missing_field_count": recovery["data_quality"].get(
+                    "missing_metric_count",
+                    len(recovery["data_quality"].get("missing_fields", [])),
+                ),
+            },
         },
     }
     full_comparison = {
@@ -2720,7 +3086,11 @@ def semantic_health_overview(
     response: dict[str, Any] = {
         "status": status,
         "timezone": zone.key,
-        "requested_range": {"start_date": start_day.isoformat(), "end_date": end_day.isoformat(), "days": days},
+        "requested_range": {
+            "start_date": start_day.isoformat(),
+            "end_date": end_day.isoformat(),
+            "days": days,
+        },
         "actual_data_range": {
             "activity": activity["actual_data_range"],
             "sleep": sleep["actual_data_range"],
@@ -2738,8 +3108,7 @@ def semantic_health_overview(
             latest_ingestion=latest_ingestion,
             details={
                 "sources": sorted(
-                    set(activity["data_quality"].get("sources", []))
-                    | set(sleep["data_quality"].get("sources", []))
+                    set(activity["data_quality"].get("sources", [])) | set(sleep["data_quality"].get("sources", []))
                 ),
                 "derived_fields": ["activity.active_energy_kcal"],
                 "missing_fields": [],
@@ -2838,11 +3207,15 @@ def query_sleep_fallback(
 ) -> dict[str, Any]:
     _validate_output_format(output_format)
     zone = _zone(timezone)
+    for field_name, value in (("start_time", start_time), ("end_time", end_time)):
+        if value and len(value.strip()) != 10:
+            raise ValueError(
+                f"{field_name} for sleep metrics must be a YYYY-MM-DD wake-date boundary; "
+                "sleep fallback ranges are half-open [start_date,end_date)"
+            )
     requested_lower = {name.lower() for name in metric_names}
     timeline_requested = any(
-        token in name
-        for name in requested_lower
-        for token in ("timeline", "interval", "awaken", "waso", "cycle")
+        token in name for name in requested_lower for token in ("timeline", "interval", "awaken", "waso", "cycle")
     )
     if timeline_requested:
         return {
@@ -2870,13 +3243,13 @@ def query_sleep_fallback(
         }
     today = datetime.now(zone).date()
     start_date = _query_date(start_time, zone, today - timedelta(days=6))
-    end_date = _query_date(end_time, zone, today)
-    if end_date < start_date:
-        raise ValueError("end_time must not be earlier than start_time")
+    end_date = _query_date(end_time, zone, today + timedelta(days=1))
+    if end_date <= start_date:
+        raise ValueError("end_time must be later than start_time; ranges are half-open [start_time,end_time)")
     matched_sessions = [
         item
         for item in _sleep_sessions(db_path, zone)
-        if start_date.isoformat() <= item["sleep_date"] <= end_date.isoformat()
+        if start_date.isoformat() <= item["sleep_date"] < end_date.isoformat()
     ]
     sessions = matched_sessions[-limit:]
     truncated = len(matched_sessions) > len(sessions)
@@ -2921,24 +3294,27 @@ def query_sleep_fallback(
             }
             for item in sessions
         ]
-    requested_nights = (end_date - start_date).days + 1
+    requested_nights = (end_date - start_date).days
     valid_nights = len(records)
     return {
         "status": "empty" if not records else "ok" if valid_nights == requested_nights else "partial",
         "timezone": zone.key,
-        "requested_range": {"start_date": start_date.isoformat(), "end_date": end_date.isoformat()},
+        "requested_range": {
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "end_exclusive": True,
+        },
         "actual_data_range": (
-            {"start_date": records[0]["sleep_date"], "end_date": records[-1]["sleep_date"]}
+            {
+                "start_date": records[0]["sleep_date"],
+                "end_date": records[-1]["sleep_date"],
+            }
             if records
             else None
         ),
         "summary": {"sleep_nights": records},
         "comparison_to_personal_baseline": {"strength": _strength(valid_nights)},
-        "highlights": (
-            [f"返回{valid_nights}晚合并后的睡眠对象"]
-            if records
-            else ["请求范围没有睡眠记录"]
-        ),
+        "highlights": ([f"返回{valid_nights}晚合并后的睡眠对象"] if records else ["请求范围没有睡眠记录"]),
         "capabilities": capabilities(db_path),
         "fetch": {"complete": not truncated},
         "data_quality": {

@@ -9,16 +9,19 @@ from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from tempfile import SpooledTemporaryFile
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
-from starlette.types import ASGIApp, Message, Receive, Scope, Send
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .semantic import (
     DEFAULT_TIMEZONE,
@@ -42,6 +45,179 @@ from .storage import (
     query_health_events as storage_query_health_events,
     query_health_metrics as storage_query_health_metrics,
     store_ingestion,
+)
+
+
+# FastMCP 1.x otherwise ignores misspelled tool arguments. Harden the generated
+# argument models before any tool decorators create their schemas.
+ArgModelBase.model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+ArgModelBase.model_rebuild(force=True)
+
+DateArgument = Annotated[
+    str,
+    Field(
+        description="Local calendar or sleep wake date in YYYY-MM-DD format.",
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+        examples=["2026-07-19"],
+    ),
+]
+OptionalDateArgument = Annotated[
+    str | None,
+    Field(
+        description="Optional local end or wake date in YYYY-MM-DD format; null uses the current/latest date.",
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+        examples=["2026-07-19"],
+    ),
+]
+TimezoneArgument = Annotated[
+    str,
+    Field(
+        description="IANA timezone used for date boundaries and returned timestamps.",
+        examples=["Asia/Shanghai"],
+    ),
+]
+OutputFormatArgument = Annotated[
+    Literal["concise", "detailed"],
+    Field(description="concise returns bounded conversational context; detailed adds bounded quality metadata."),
+]
+FallbackOutputFormatArgument = Annotated[
+    Literal["concise", "detailed"],
+    Field(
+        description=(
+            "concise returns normalized fallback records; detailed adds original payloads for debugging when they "
+            "fit the server's response budget and reports omissions explicitly."
+        )
+    ),
+]
+DaysArgument = Annotated[
+    Literal[7, 14, 30],
+    Field(description="Requested local-day range: 7, 14, or 30 days.", examples=[7]),
+]
+NightsArgument = Annotated[
+    Literal[7, 14, 30],
+    Field(
+        description="Requested sleep wake-date range: 7, 14, or 30 nights.",
+        examples=[7],
+    ),
+]
+WorkoutIdArgument = Annotated[
+    str,
+    Field(
+        description="Stable workout_id copied from list_workouts.",
+        min_length=1,
+        examples=["935872D1-A7A1-428A-BD42-DE472862DC53"],
+    ),
+]
+WorkoutTypeArgument = Annotated[
+    str | None,
+    Field(
+        description=(
+            "Optional exact workout type or family alias: cycling/骑行, walking/步行, "
+            "running/跑步, or strength/力量训练."
+        ),
+        examples=["骑行"],
+    ),
+]
+MetricNamesArgument = Annotated[
+    list[str],
+    Field(
+        description="One to ten exact metric names from list_available_data.",
+        min_length=1,
+        max_length=10,
+        examples=[["heart_rate"]],
+    ),
+]
+CategoriesArgument = Annotated[
+    list[str] | None,
+    Field(
+        description="Optional exact event category names from list_available_data; null queries all categories.",
+        max_length=20,
+        examples=[["cycleTracking"]],
+    ),
+]
+StartTimeArgument = Annotated[
+    str | None,
+    Field(
+        description=("Inclusive range start as ISO-8601 date or timestamp. A date means local midnight in timezone."),
+        examples=["2026-07-18T00:00:00+08:00"],
+    ),
+]
+EndTimeArgument = Annotated[
+    str | None,
+    Field(
+        description=("Exclusive range end as ISO-8601 date or timestamp. A date means local midnight in timezone."),
+        examples=["2026-07-19T00:00:00+08:00"],
+    ),
+]
+WorkoutLimitArgument = Annotated[
+    int,
+    Field(description="Maximum workouts returned.", ge=1, le=50, examples=[20]),
+]
+MetricLimitArgument = Annotated[
+    int,
+    Field(description="Maximum metric records returned.", ge=1, le=1000, examples=[20]),
+]
+EventLimitArgument = Annotated[
+    int,
+    Field(description="Maximum event records returned.", ge=1, le=500, examples=[20]),
+]
+BaselineCountArgument = Annotated[
+    Literal[3, 5, 10],
+    Field(
+        description="Number of prior same-type workouts considered for the baseline.",
+        examples=[5],
+    ),
+]
+
+
+class _ExtensibleResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+
+class SemanticToolResponse(_ExtensibleResponse):
+    status: Literal["ok", "partial", "empty", "error"]
+    summary: dict[str, Any]
+    highlights: list[str]
+    data_quality: dict[str, Any]
+
+
+class FallbackToolResponse(_ExtensibleResponse):
+    status: Literal["ok", "partial", "empty", "error"]
+
+
+class CatalogToolResponse(_ExtensibleResponse):
+    status: Literal["ok", "partial", "empty", "error"]
+    summary: dict[str, Any]
+    latest_ingestion: str | None
+    role: str
+
+
+class EventQueryToolResponse(_ExtensibleResponse):
+    status: Literal["ok", "partial", "empty", "error"]
+    query: dict[str, Any]
+    events: list[dict[str, Any]]
+    event_count: int
+    total_event_count: int
+    fetch: dict[str, Any]
+    payloads: dict[str, Any]
+    data_quality: dict[str, Any]
+
+
+class GuideToolResponse(_ExtensibleResponse):
+    server: str
+    as_of_date: str
+    purpose: str
+    required_behavior: str
+    recommended_sequence: list[dict[str, Any]]
+    important_rules: list[str]
+    capabilities: dict[str, bool]
+
+
+READ_ONLY_TOOL = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
 )
 
 
@@ -103,7 +279,10 @@ class MCPBearerAuthMiddleware:
             token = _bearer_token(scope.get("headers", []))
             if not _authorized(token, get_settings().mcp_token):
                 response = JSONResponse(
-                    {"error": "unauthorized", "resolution": "Send Authorization: Bearer <MCP_TOKEN>"},
+                    {
+                        "error": "unauthorized",
+                        "resolution": "Send Authorization: Bearer <MCP_TOKEN>",
+                    },
                     status_code=401,
                     headers={"WWW-Authenticate": "Bearer"},
                 )
@@ -139,71 +318,87 @@ mcp = FastMCP(
 )
 
 
-@mcp.tool(name="guide")
-def guide() -> dict[str, Any]:
+@mcp.tool(name="guide", annotations=READ_ONLY_TOOL)
+def guide() -> GuideToolResponse:
     """Return the AppleHealth MCP usage and tool-selection guide in Chinese and English.
 
     Use this as the first call when the user asks how to use AppleHealth, what health information is available, or
-    which tool should answer a request. This tool accepts no inputs and returns exact fully qualified tool names,
-    selection rules, valid argument examples, and a recommended call sequence. It does not return health values;
+    which tool should answer a request. This tool accepts no inputs and returns exact tools/list wire names,
+    selection rules, argument templates/sources, and a recommended call sequence. It does not return health values;
     after reading the guide, immediately call the recommended data tool instead of answering from the guide alone.
     """
+    as_of_date = datetime.now(ZoneInfo(DEFAULT_TIMEZONE)).date().isoformat()
     return {
         "server": "AppleHealth",
+        "as_of_date": as_of_date,
         "purpose": "为对话AI提供已经清洗、聚合并带个人基线的健康语义上下文；所有数据工具均为只读。",
         "required_behavior": (
-            "根据用户问题选择下方工具并继续调用。guide 只负责导航，不能代替实际健康数据查询。"
+            "根据用户问题选择下方tools/list原始名称继续调用。宿主可能显示AppleHealth:前缀，但原始"
+            "tools/call.name必须使用tool字段。guide只负责导航，不能代替实际健康数据查询。"
         ),
         "recommended_sequence": [
             {
                 "when": "用户问昨晚睡得怎么样",
-                "tool": "AppleHealth:get_sleep_summary",
-                "arguments_example": {"date": "2026-07-18"},
+                "tool": "get_sleep_summary",
+                "arguments_example": {"date": as_of_date},
             },
             {
                 "when": "用户问最近一周/两周/一月睡眠趋势",
-                "tool": "AppleHealth:get_sleep_trend",
+                "tool": "get_sleep_trend",
                 "arguments_example": {"nights": 7},
             },
             {
                 "when": "用户问疲劳、晨练前恢复状态或今天是否适合高强度运动",
-                "tool": "AppleHealth:get_recovery_snapshot",
+                "tool": "get_recovery_snapshot",
                 "arguments_example": {},
             },
             {
                 "when": "用户问今天的步数、活动量或晨练情况",
-                "tool": "AppleHealth:get_daily_activity",
-                "arguments_example": {"date": "2026-07-18"},
+                "tool": "get_daily_activity",
+                "arguments_example": {"date": as_of_date},
             },
             {
                 "when": "用户问最近活动趋势",
-                "tool": "AppleHealth:get_activity_trend",
+                "tool": "get_activity_trend",
                 "arguments_example": {"days": 7},
             },
             {
                 "when": "用户问最近做过哪些锻炼、跑步、骑行或健身",
-                "tool": "AppleHealth:list_workouts",
+                "tool": "list_workouts",
                 "arguments_example": {"days": 7},
             },
             {
                 "when": "用户问某一次锻炼的距离、心率、能量、速度或路线是否存在",
-                "tool": "AppleHealth:get_workout_detail",
-                "arguments_example": {"workout_id": "先从AppleHealth:list_workouts取得"},
+                "tool": "get_workout_detail",
+                "requires_previous_call": "list_workouts",
+                "arguments_source": "list_workouts.summary.workouts[].workout_id",
             },
             {
                 "when": "用户问这次锻炼相比上次或个人同类历史表现如何",
-                "tool": "AppleHealth:compare_workouts",
-                "arguments_example": {"workout_id": "先从AppleHealth:list_workouts取得", "baseline_count": 5},
+                "tool": "compare_workouts",
+                "requires_previous_call": "list_workouts",
+                "arguments_source": "list_workouts.summary.workouts[].workout_id",
+                "optional_arguments_example": {"baseline_count": 5},
             },
             {
                 "when": "用户要求最近7/14/30天的综合健康概览",
-                "tool": "AppleHealth:get_health_overview",
+                "tool": "get_health_overview",
                 "arguments_example": {"days": 7},
             },
             {
-                "when": "专用工具无法回答、精确指标名未知、上传排查或明确要求原始记录",
-                "tool": "AppleHealth:list_available_data / query_health_metrics / query_health_events",
+                "when": "专用工具无法回答且精确指标名未知",
+                "tool": "list_available_data",
                 "arguments_example": {"output_format": "concise"},
+            },
+            {
+                "when": "已知精确指标名且需要底层样本或机械聚合",
+                "tool": "query_health_metrics",
+                "arguments_example": {"metric_names": ["heart_rate"], "limit": 20},
+            },
+            {
+                "when": "需要排查workout、经期或其他非指标事件",
+                "tool": "query_health_events",
+                "arguments_example": {"categories": ["cycleTracking"], "limit": 20},
             },
         ],
         "important_rules": [
@@ -211,6 +406,7 @@ def guide() -> dict[str, Any]:
             "默认时区Asia/Shanghai，日期使用YYYY-MM-DD。",
             "场景工具默认concise；detailed仍是有界语义数据，不含原始payload。",
             "只有fallback raw+detailed用于排查或用户明确要求原始记录。",
+            "过大的原始事件payload会被有界摘要替代，并以status=partial和payloads.complete=false标记。",
             "缺失值是null，不得解释为0。",
             "fetch.complete表示查询未被截断；coverage.complete表示请求日/晚是否都有数据。",
             "valid_days/valid_nights不足时不得宣称长期趋势。",
@@ -220,13 +416,16 @@ def guide() -> dict[str, Any]:
     }
 
 
-@mcp.tool(name="get_sleep_summary")
+@mcp.tool(name="get_sleep_summary", annotations=READ_ONLY_TOOL)
 def get_sleep_summary(
-    date: str,
-    timezone: str = DEFAULT_TIMEZONE,
-    include_recovery_metrics: bool = True,
-    output_format: Literal["concise", "detailed"] = "concise",
-) -> dict[str, Any]:
+    date: DateArgument,
+    timezone: TimezoneArgument = DEFAULT_TIMEZONE,
+    include_recovery_metrics: Annotated[
+        bool,
+        Field(description="Include bounded sleep-window recovery metrics; unavailable values remain null."),
+    ] = True,
+    output_format: OutputFormatArgument = "concise",
+) -> SemanticToolResponse:
     """Return one semantic sleep object for the night assigned to its wake date.
 
     Use directly for questions such as "昨晚睡得怎么样". `date` is YYYY-MM-DD in `timezone` (default
@@ -234,18 +433,16 @@ def get_sleep_summary(
     only when explicitly trustworthy, suppresses interval recovery joins for low-confidence boundaries, and compares
     with prior personal nights. Concise is bounded; detailed adds quality/capability metadata but never raw payloads.
     """
-    return semantic_get_sleep_summary(
-        get_settings().db_path, date, timezone, include_recovery_metrics, output_format
-    )
+    return semantic_get_sleep_summary(get_settings().db_path, date, timezone, include_recovery_metrics, output_format)
 
 
-@mcp.tool(name="get_sleep_trend")
+@mcp.tool(name="get_sleep_trend", annotations=READ_ONLY_TOOL)
 def get_sleep_trend(
-    nights: Literal[7, 14, 30],
-    timezone: str = DEFAULT_TIMEZONE,
-    output_format: Literal["concise", "detailed"] = "concise",
-    end_date: str | None = None,
-) -> dict[str, Any]:
+    nights: NightsArgument,
+    timezone: TimezoneArgument = DEFAULT_TIMEZONE,
+    output_format: OutputFormatArgument = "concise",
+    end_date: OptionalDateArgument = None,
+) -> SemanticToolResponse:
     """Return nightly sleep summaries and a bounded trend for the latest 7, 14, or 30 wake dates.
 
     Use for recent sleep-trend questions. Returns valid_nights, missing_nights, actual coverage, averages/medians, and
@@ -254,12 +451,12 @@ def get_sleep_trend(
     return semantic_get_sleep_trend(get_settings().db_path, nights, timezone, output_format, end_date)
 
 
-@mcp.tool(name="get_recovery_snapshot")
+@mcp.tool(name="get_recovery_snapshot", annotations=READ_ONLY_TOOL)
 def get_recovery_snapshot(
-    date: str | None = None,
-    timezone: str = DEFAULT_TIMEZONE,
-    output_format: Literal["concise", "detailed"] = "concise",
-) -> dict[str, Any]:
+    date: OptionalDateArgument = None,
+    timezone: TimezoneArgument = DEFAULT_TIMEZONE,
+    output_format: OutputFormatArgument = "concise",
+) -> SemanticToolResponse:
     """Return a recovery context for one wake date using sleep, heart rate, HRV, breathing, oxygen, and wrist temperature.
 
     Use for fatigue, morning training, and recovery questions. Omit `date` to use the latest uploaded sleep night.
@@ -270,12 +467,12 @@ def get_recovery_snapshot(
     return semantic_get_recovery_snapshot(get_settings().db_path, date, timezone, output_format)
 
 
-@mcp.tool(name="get_daily_activity")
+@mcp.tool(name="get_daily_activity", annotations=READ_ONLY_TOOL)
 def get_daily_activity(
-    date: str,
-    timezone: str = DEFAULT_TIMEZONE,
-    output_format: Literal["concise", "detailed"] = "concise",
-) -> dict[str, Any]:
+    date: DateArgument,
+    timezone: TimezoneArgument = DEFAULT_TIMEZONE,
+    output_format: OutputFormatArgument = "concise",
+) -> SemanticToolResponse:
     """Return one local day's semantic activity summary and personal-baseline comparison.
 
     Use for today's or a specified day's steps, distance, active energy, exercise minutes, stand hours, daylight, and
@@ -285,13 +482,13 @@ def get_daily_activity(
     return semantic_get_daily_activity(get_settings().db_path, date, timezone, output_format)
 
 
-@mcp.tool(name="get_activity_trend")
+@mcp.tool(name="get_activity_trend", annotations=READ_ONLY_TOOL)
 def get_activity_trend(
-    days: Literal[7, 14, 30],
-    timezone: str = DEFAULT_TIMEZONE,
-    output_format: Literal["concise", "detailed"] = "concise",
-    end_date: str | None = None,
-) -> dict[str, Any]:
+    days: DaysArgument,
+    timezone: TimezoneArgument = DEFAULT_TIMEZONE,
+    output_format: OutputFormatArgument = "concise",
+    end_date: OptionalDateArgument = None,
+) -> SemanticToolResponse:
     """Return semantic activity coverage and trends for the latest 7, 14, or 30 local days.
 
     Use for recent activity-volume questions. Returns valid_days, missing_days, bounded daily averages/totals, and a
@@ -300,15 +497,15 @@ def get_activity_trend(
     return semantic_get_activity_trend(get_settings().db_path, days, timezone, output_format, end_date)
 
 
-@mcp.tool(name="list_workouts")
+@mcp.tool(name="list_workouts", annotations=READ_ONLY_TOOL)
 def list_workouts(
-    days: Literal[7, 14, 30],
-    timezone: str = DEFAULT_TIMEZONE,
-    output_format: Literal["concise", "detailed"] = "concise",
-    end_date: str | None = None,
-    workout_type: str | None = None,
-    limit: int = 20,
-) -> dict[str, Any]:
+    days: DaysArgument,
+    timezone: TimezoneArgument = DEFAULT_TIMEZONE,
+    output_format: OutputFormatArgument = "concise",
+    end_date: OptionalDateArgument = None,
+    workout_type: WorkoutTypeArgument = None,
+    limit: WorkoutLimitArgument = 20,
+) -> SemanticToolResponse:
     """Return compact workout sessions for the latest 7, 14, or 30 local days.
 
     Use when the user asks which workouts, runs, rides, walks, or gym sessions occurred recently. Results include stable
@@ -317,19 +514,25 @@ def list_workouts(
     from baselines. `workout_type` is optional; `limit` defaults to 20. Raw routes/sensor samples are never returned.
     """
     return semantic_list_workouts(
-        get_settings().db_path, days, timezone, output_format, end_date, workout_type, limit
+        get_settings().db_path,
+        days,
+        timezone,
+        output_format,
+        end_date,
+        workout_type,
+        limit,
     )
 
 
-@mcp.tool(name="get_workout_detail")
+@mcp.tool(name="get_workout_detail", annotations=READ_ONLY_TOOL)
 def get_workout_detail(
-    workout_id: str,
-    timezone: str = DEFAULT_TIMEZONE,
-    output_format: Literal["concise", "detailed"] = "concise",
-) -> dict[str, Any]:
+    workout_id: WorkoutIdArgument,
+    timezone: TimezoneArgument = DEFAULT_TIMEZONE,
+    output_format: OutputFormatArgument = "concise",
+) -> SemanticToolResponse:
     """Return one cleaned workout session with a same-type personal-baseline comparison.
 
-    Use after `AppleHealth:list_workouts` when the user asks about one specific workout. `workout_id` must come from that
+    Use after `list_workouts` when the user asks about one specific workout. `workout_id` must come from that
     tool. Returns local start/end time, duration, distance, energy, heart-rate range, speed/pace, elevation, sensor
     coverage, missing fields, and comparison with up to five prior workouts of the same type. Even detailed output is
     bounded and does not expose route coordinates or full heart-rate samples; use the raw fallback only for debugging.
@@ -337,18 +540,24 @@ def get_workout_detail(
     return semantic_get_workout_detail(get_settings().db_path, workout_id, timezone, output_format)
 
 
-@mcp.tool(name="compare_workouts")
+@mcp.tool(name="compare_workouts", annotations=READ_ONLY_TOOL)
 def compare_workouts(
-    workout_id: str,
-    comparison_workout_id: str | None = None,
-    baseline_count: Literal[3, 5, 10] = 5,
-    timezone: str = DEFAULT_TIMEZONE,
-    output_format: Literal["concise", "detailed"] = "concise",
-) -> dict[str, Any]:
+    workout_id: WorkoutIdArgument,
+    comparison_workout_id: Annotated[
+        str | None,
+        Field(
+            description="Optional same-type workout_id copied from list_workouts.",
+            min_length=1,
+        ),
+    ] = None,
+    baseline_count: BaselineCountArgument = 5,
+    timezone: TimezoneArgument = DEFAULT_TIMEZONE,
+    output_format: OutputFormatArgument = "concise",
+) -> SemanticToolResponse:
     """Compare one workout with another workout or with the user's recent same-type baseline.
 
     Use for questions such as "这次骑行比上次怎样" or "这次跑步表现怎样". Obtain IDs from
-    `AppleHealth:list_workouts`. When `comparison_workout_id` is provided, the tool compares those two sessions;
+    `list_workouts`. When `comparison_workout_id` is provided, both sessions must have the same workout type;
     otherwise it compares `workout_id` with up to `baseline_count` prior workouts of the same type. Returns mechanical
     absolute/percentage differences with coverage strength, not a medical or readiness judgment. `baseline_count`
     defaults to 5 and `output_format` defaults to concise.
@@ -363,11 +572,11 @@ def compare_workouts(
     )
 
 
-@mcp.tool(name="list_available_data")
+@mcp.tool(name="list_available_data", annotations=READ_ONLY_TOOL)
 def list_available_data(
-    output_format: Literal["concise", "detailed"] = "concise",
-    timezone: str = DEFAULT_TIMEZONE,
-) -> dict[str, Any]:
+    output_format: OutputFormatArgument = "concise",
+    timezone: TimezoneArgument = DEFAULT_TIMEZONE,
+) -> CatalogToolResponse:
     """List health metric names, event categories, coverage, and ingestion status.
 
     Fallback only: use when a specialized scene tool cannot answer, the exact exported metric/category names are
@@ -379,29 +588,36 @@ def list_available_data(
     return list_available_data_semantic(get_settings().db_path, output_format, timezone)
 
 
-@mcp.tool(name="query_health_metrics")
+@mcp.tool(name="query_health_metrics", annotations=READ_ONLY_TOOL)
 def query_health_metrics(
-    metric_names: list[str] | None = None,
-    start_time: str | None = None,
-    end_time: str | None = None,
-    aggregation: Literal["raw", "hour", "day"] = "day",
-    limit: int = 200,
-    output_format: Literal["concise", "detailed"] = "concise",
-    timezone: str = DEFAULT_TIMEZONE,
-) -> dict[str, Any]:
+    metric_names: MetricNamesArgument,
+    start_time: StartTimeArgument = None,
+    end_time: EndTimeArgument = None,
+    aggregation: Annotated[
+        Literal["raw", "hour", "day"],
+        Field(description="raw samples or mechanical local hour/day aggregation."),
+    ] = "day",
+    limit: MetricLimitArgument = 20,
+    output_format: FallbackOutputFormatArgument = "concise",
+    timezone: TimezoneArgument = DEFAULT_TIMEZONE,
+) -> FallbackToolResponse:
     """Query numeric or categorical Apple Health metric samples over time.
 
     Fallback only: use for exact metric debugging or explicit raw record requests after specialized tools cannot answer.
-    Metric names are exact exported names; omit them to query all metrics. Times accept ISO-8601
-    dates or timestamps and default to the last 7 days. `raw` returns samples, while `hour` and `day` return mechanical
+    Metric names are required exact names from `list_available_data`. Times accept ISO-8601 dates or timestamps;
+    sleep-analysis names specifically use YYYY-MM-DD wake-date boundaries,
+    use a half-open [start_time,end_time) range, and default to the last 7 days. `raw` returns samples, while `hour` and `day` return mechanical
     aggregates. Set `output_format="detailed"` with `aggregation="raw"` to include the complete original exported sample,
-    including fields not promoted into standard columns. `limit` is 1-1000. Returns the resolved query window plus
+    including fields not promoted into standard columns. `limit` defaults to 20 and is 1-1000. Returns the resolved query window plus
     records. Validation errors state the accepted format and can be corrected without changing other parameters.
     """
     requested_names = metric_names or []
-    sleep_names = [name for name in requested_names if name.lower().startswith("sleep_analysis") or any(
-        token in name.lower() for token in ("sleep_stage_timeline", "awaken", "waso", "sleep_cycle")
-    )]
+    sleep_names = [
+        name
+        for name in requested_names
+        if name.lower().startswith("sleep_analysis")
+        or any(token in name.lower() for token in ("sleep_stage_timeline", "awaken", "waso", "sleep_cycle"))
+    ]
     non_sleep_names = [name for name in requested_names if name not in sleep_names]
     sleep_result = None
     if sleep_names:
@@ -432,9 +648,7 @@ def query_health_metrics(
     if sleep_result is not None:
         return {
             "status": (
-                "partial"
-                if sleep_result["status"] == "partial" or metric_result.get("status") == "partial"
-                else "ok"
+                "partial" if sleep_result["status"] == "partial" or metric_result.get("status") == "partial" else "ok"
             ),
             "timezone": timezone,
             "sleep": sleep_result,
@@ -443,21 +657,21 @@ def query_health_metrics(
     return metric_result
 
 
-@mcp.tool(name="query_health_events")
+@mcp.tool(name="query_health_events", annotations=READ_ONLY_TOOL)
 def query_health_events(
-    categories: list[str] | None = None,
-    start_time: str | None = None,
-    end_time: str | None = None,
-    limit: int = 100,
-    output_format: Literal["concise", "detailed"] = "concise",
-    timezone: str = DEFAULT_TIMEZONE,
-) -> dict[str, Any]:
+    categories: CategoriesArgument = None,
+    start_time: StartTimeArgument = None,
+    end_time: EndTimeArgument = None,
+    limit: EventLimitArgument = 20,
+    output_format: FallbackOutputFormatArgument = "concise",
+    timezone: TimezoneArgument = DEFAULT_TIMEZONE,
+) -> EventQueryToolResponse:
     """Query non-metric Apple Health records such as workouts, symptoms, ECGs, medications, or cycle events.
 
     Fallback only: use for upload debugging or explicit raw event requests. Use event category names returned by
     `list_available_data`; omit categories to query all. Times accept ISO-8601
-    dates or timestamps and default to the last 30 days. `concise` returns identifying fields; `detailed` also returns
-    the complete exported event object. `limit` is 1-500. Returns resolved filters and newest events first. Validation
+    dates or timestamps, use a half-open [start_time,end_time) range, and default to the last 30 days. `concise` returns identifying fields; `detailed` includes
+    original event payloads only within a bounded response budget and explicitly summarizes oversized omissions. `limit` defaults to 20 and is 1-500. Returns resolved filters and newest events first. Validation
     errors specify the parameter that must be corrected.
     """
     result = storage_query_health_events(
@@ -484,13 +698,13 @@ def query_health_events(
     return result
 
 
-@mcp.tool(name="get_health_overview")
+@mcp.tool(name="get_health_overview", annotations=READ_ONLY_TOOL)
 def get_health_overview(
-    days: Literal[7, 14, 30],
-    timezone: str = DEFAULT_TIMEZONE,
-    output_format: Literal["concise", "detailed"] = "concise",
-    end_date: str | None = None,
-) -> dict[str, Any]:
+    days: DaysArgument,
+    timezone: TimezoneArgument = DEFAULT_TIMEZONE,
+    output_format: OutputFormatArgument = "concise",
+    end_date: OptionalDateArgument = None,
+) -> SemanticToolResponse:
     """Return a compact cross-metric overview for a recent period.
 
     Use for broad 7/14/30-day context when a narrower sleep, recovery, or activity tool is not sufficient. Returns
@@ -563,7 +777,11 @@ async def api_sleep_summary(request: Request) -> JSONResponse:
     date = query.get("date")
     if not date:
         return JSONResponse(
-            {"status": "error", "error": "missing_date", "resolution": "Provide date=YYYY-MM-DD."},
+            {
+                "status": "error",
+                "error": "missing_date",
+                "resolution": "Provide date=YYYY-MM-DD.",
+            },
             status_code=400,
         )
     return _semantic_api_response(
@@ -607,7 +825,11 @@ async def api_daily_activity(request: Request) -> JSONResponse:
     date = query.get("date")
     if not date:
         return JSONResponse(
-            {"status": "error", "error": "missing_date", "resolution": "Provide date=YYYY-MM-DD."},
+            {
+                "status": "error",
+                "error": "missing_date",
+                "resolution": "Provide date=YYYY-MM-DD.",
+            },
             status_code=400,
         )
     return _semantic_api_response(
@@ -711,7 +933,10 @@ async def ingest(request: Request) -> JSONResponse:
     token = _bearer_token(list(request.scope.get("headers", [])))
     if not _authorized(token, get_settings().ingest_token):
         return JSONResponse(
-            {"error": "unauthorized", "resolution": "Send Authorization: Bearer <INGEST_TOKEN>"},
+            {
+                "error": "unauthorized",
+                "resolution": "Send Authorization: Bearer <INGEST_TOKEN>",
+            },
             status_code=401,
             headers={"WWW-Authenticate": "Bearer"},
         )
@@ -719,7 +944,11 @@ async def ingest(request: Request) -> JSONResponse:
     content_type = request.headers.get("content-type", "")
     if not content_type.lower().startswith("application/json"):
         return JSONResponse(
-            {"error": "invalid_content_type", "expected": "application/json", "received": content_type},
+            {
+                "error": "invalid_content_type",
+                "expected": "application/json",
+                "received": content_type,
+            },
             status_code=415,
         )
 
@@ -748,7 +977,11 @@ async def ingest(request: Request) -> JSONResponse:
         payload = json.loads(raw_json)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         return JSONResponse(
-            {"error": "invalid_json", "resolution": "Export as JSON version 2.", "detail": str(error)},
+            {
+                "error": "invalid_json",
+                "resolution": "Export as JSON version 2.",
+                "detail": str(error),
+            },
             status_code=400,
         )
 

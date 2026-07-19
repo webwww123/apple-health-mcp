@@ -149,9 +149,7 @@ def initialize_database(db_path: Path) -> None:
 
 
 def _ensure_schema_migrations(connection: sqlite3.Connection) -> None:
-    columns = {
-        row["name"] for row in connection.execute("PRAGMA table_info(metric_samples)").fetchall()
-    }
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(metric_samples)").fetchall()}
     additions = {
         "source_name": "TEXT",
         "source_bundle_id": "TEXT",
@@ -206,7 +204,6 @@ def _zone(timezone: str) -> ZoneInfo:
 def normalize_query_time(
     value: str | None,
     *,
-    end_of_day: bool = False,
     timezone: str = "UTC",
 ) -> str | None:
     if value is None or not value.strip():
@@ -216,18 +213,12 @@ def normalize_query_time(
         try:
             parsed = datetime.fromisoformat(candidate).replace(tzinfo=_zone(timezone))
         except ValueError as error:
-            raise ValueError(
-                "Time must be ISO-8601, for example 2026-07-18 or 2026-07-18T10:00:00+02:00"
-            ) from error
-        if end_of_day:
-            parsed += timedelta(days=1)
+            raise ValueError("Time must be ISO-8601, for example 2026-07-18 or 2026-07-18T10:00:00+02:00") from error
         return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
     try:
         parsed = datetime.fromisoformat(candidate[:-1] + "+00:00" if candidate.endswith("Z") else candidate)
     except ValueError as error:
-        raise ValueError(
-            "Time must be ISO-8601, for example 2026-07-18 or 2026-07-18T10:00:00+02:00"
-        ) from error
+        raise ValueError("Time must be ISO-8601, for example 2026-07-18 or 2026-07-18T10:00:00+02:00") from error
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
@@ -357,7 +348,16 @@ def _metric_rows(payload: Any) -> Iterable[dict[str, Any]]:
             raw = _compact_json(sample)
             sample_uuid = _text(_first(sample, "uuid", "id", "identifier"))
             is_sleep_summary = metric_name.lower() == "sleep_analysis" and any(
-                key in sample for key in ("totalSleep", "asleep", "awake", "core", "deep", "rem", "inBed")
+                key in sample
+                for key in (
+                    "totalSleep",
+                    "asleep",
+                    "awake",
+                    "core",
+                    "deep",
+                    "rem",
+                    "inBed",
+                )
             )
             start_time = _normalize_time(
                 _first(
@@ -370,9 +370,7 @@ def _metric_rows(payload: Any) -> Iterable[dict[str, Any]]:
             end_time = _normalize_time(
                 _first(
                     sample,
-                    *("sleepEnd", "inBedEnd")
-                    if is_sleep_summary
-                    else ("endDate", "endTime", "end"),
+                    *("sleepEnd", "inBedEnd") if is_sleep_summary else ("endDate", "endTime", "end"),
                 )
             )
             numeric_value = _number(_first(sample, "qty", "quantity", "numericValue", "value"))
@@ -437,9 +435,7 @@ def _metric_rows(payload: Any) -> Iterable[dict[str, Any]]:
                             "sum_value": None,
                             "value_text": None,
                             "sample_uuid": f"{sample_uuid}:{suffix}" if sample_uuid else None,
-                            "original_record_id": (
-                                f"{sample_uuid}:{suffix}" if sample_uuid else None
-                            ),
+                            "original_record_id": (f"{sample_uuid}:{suffix}" if sample_uuid else None),
                         }
                     )
                     derived_row["fingerprint"] = _metric_fingerprint(derived_row)
@@ -499,8 +495,7 @@ def _event_rows(payload: Any) -> Iterable[dict[str, Any]]:
                 identity = f"source:{source or ''}:type:{event_type or ''}:bucket:{bucket_time}"
             elif start_time or end_time:
                 identity = (
-                    f"source:{source or ''}:type:{event_type or ''}:"
-                    f"start:{start_time or ''}:end:{end_time or ''}"
+                    f"source:{source or ''}:type:{event_type or ''}:start:{start_time or ''}:end:{end_time or ''}"
                 )
             else:
                 identity = f"raw:{_sha256(raw)}"
@@ -663,12 +658,8 @@ def store_ingestion(
             ),
         )
         ingestion_id = int(cursor.lastrowid)
-        metrics_before = int(
-            connection.execute("SELECT COUNT(*) AS count FROM metric_samples").fetchone()["count"]
-        )
-        events_before = int(
-            connection.execute("SELECT COUNT(*) AS count FROM health_events").fetchone()["count"]
-        )
+        metrics_before = int(connection.execute("SELECT COUNT(*) AS count FROM metric_samples").fetchone()["count"])
+        events_before = int(connection.execute("SELECT COUNT(*) AS count FROM health_events").fetchone()["count"])
         metric_count = 0
         event_count = 0
 
@@ -681,12 +672,8 @@ def store_ingestion(
             event_count += 1
 
         _recount_ingestions(connection)
-        metrics_after = int(
-            connection.execute("SELECT COUNT(*) AS count FROM metric_samples").fetchone()["count"]
-        )
-        events_after = int(
-            connection.execute("SELECT COUNT(*) AS count FROM health_events").fetchone()["count"]
-        )
+        metrics_after = int(connection.execute("SELECT COUNT(*) AS count FROM metric_samples").fetchone()["count"])
+        events_after = int(connection.execute("SELECT COUNT(*) AS count FROM health_events").fetchone()["count"])
 
     return {
         "ok": True,
@@ -798,9 +785,9 @@ def audit_metric_duplicates(
 
     for metric_name, stats in metric_stats.items():
         stats["unique_rows"] = stats["raw_rows"] - stats["duplicates_removed"]
-        stats["duplicate_ratio"] = round(
-            stats["duplicates_removed"] / stats["raw_rows"], 4
-        ) if stats["raw_rows"] else 0.0
+        stats["duplicate_ratio"] = (
+            round(stats["duplicates_removed"] / stats["raw_rows"], 4) if stats["raw_rows"] else 0.0
+        )
         stats["affected_dates"] = sorted(stats["affected_dates"])
 
     total_raw = sum(raw_counts.values())
@@ -808,9 +795,7 @@ def audit_metric_duplicates(
     return {
         "timezone": zone.key,
         "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-        "candidate_key": (
-            "metric_name+start_time+end_time+unit+numeric/min/max/avg/sum/value_text"
-        ),
+        "candidate_key": ("metric_name+start_time+end_time+unit+numeric/min/max/avg/sum/value_text"),
         "total_raw_rows": total_raw,
         "total_unique_rows": total_raw - total_removed,
         "duplicate_group_count": len(groups),
@@ -824,11 +809,7 @@ def audit_metric_duplicates(
 
 def _archive_candidate_duplicates(connection: sqlite3.Connection) -> int:
     archived_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-    before = int(
-        connection.execute("SELECT COUNT(*) AS count FROM metric_sample_duplicates").fetchone()[
-            "count"
-        ]
-    )
+    before = int(connection.execute("SELECT COUNT(*) AS count FROM metric_sample_duplicates").fetchone()["count"])
     connection.execute(
         """
         INSERT OR IGNORE INTO metric_sample_duplicates (
@@ -870,11 +851,7 @@ def _archive_candidate_duplicates(connection: sqlite3.Connection) -> int:
         """,
         (archived_at,),
     )
-    after = int(
-        connection.execute("SELECT COUNT(*) AS count FROM metric_sample_duplicates").fetchone()[
-            "count"
-        ]
-    )
+    after = int(connection.execute("SELECT COUNT(*) AS count FROM metric_sample_duplicates").fetchone()["count"])
     return after - before
 
 
@@ -953,10 +930,14 @@ def _deduplicate_cumulative_rows(rows: list[dict[str, Any]]) -> list[dict[str, A
             int(row.get("id") or 0),
         )
         existing_score = (
-            _source_priority(existing),
-            str(existing.get("received_at") or ""),
-            int(existing.get("id") or 0),
-        ) if existing else (-1, "", -1)
+            (
+                _source_priority(existing),
+                str(existing.get("received_at") or ""),
+                int(existing.get("id") or 0),
+            )
+            if existing
+            else (-1, "", -1)
+        )
         if existing is None or score > existing_score:
             winners[key] = row
     return list(winners.values())
@@ -1114,7 +1095,7 @@ def query_health_metrics(
     start_time: str | None = None,
     end_time: str | None = None,
     aggregation: Literal["raw", "hour", "day"] = "day",
-    limit: int = 200,
+    limit: int = 20,
     output_format: Literal["concise", "detailed"] = "concise",
     timezone: str = "UTC",
 ) -> dict[str, Any]:
@@ -1125,19 +1106,22 @@ def query_health_metrics(
     default_start, default_end = default_time_window(7)
     zone = _zone(timezone)
     start = normalize_query_time(start_time, timezone=zone.key) or default_start
-    end = normalize_query_time(end_time, end_of_day=True, timezone=zone.key) or default_end
+    end = normalize_query_time(end_time, timezone=zone.key) or default_end
+    if start >= end:
+        raise ValueError("end_time must be later than start_time; ranges are half-open [start_time,end_time)")
     where, params = _metric_filters(metric_names, start, end)
     initialize_database(db_path)
 
     with connect(db_path) as connection:
         matched_active = int(
-            connection.execute(
-                f"SELECT COUNT(*) AS count FROM metric_samples WHERE {where}", params
-            ).fetchone()["count"]
+            connection.execute(f"SELECT COUNT(*) AS count FROM metric_samples WHERE {where}", params).fetchone()[
+                "count"
+            ]
         )
         archived_rows = int(
             connection.execute(
-                f"SELECT COUNT(*) AS count FROM metric_sample_duplicates WHERE {where}", params
+                f"SELECT COUNT(*) AS count FROM metric_sample_duplicates WHERE {where}",
+                params,
             ).fetchone()["count"]
         )
         overlap_removed = 0
@@ -1207,32 +1191,19 @@ def query_health_metrics(
                 average_values = [
                     value
                     for row in bucket_rows
-                    if (value := _first_number(row, "avg_value", "numeric_value", "sum_value"))
-                    is not None
+                    if (value := _first_number(row, "avg_value", "numeric_value", "sum_value")) is not None
                 ]
                 minimum_values = [
                     value
                     for row in bucket_rows
-                    if (
-                        value := _first_number(
-                            row, "min_value", "numeric_value", "avg_value", "sum_value"
-                        )
-                    )
-                    is not None
+                    if (value := _first_number(row, "min_value", "numeric_value", "avg_value", "sum_value")) is not None
                 ]
                 maximum_values = [
                     value
                     for row in bucket_rows
-                    if (
-                        value := _first_number(
-                            row, "max_value", "numeric_value", "avg_value", "sum_value"
-                        )
-                    )
-                    is not None
+                    if (value := _first_number(row, "max_value", "numeric_value", "avg_value", "sum_value")) is not None
                 ]
-                total_values = [
-                    value for row in bucket_rows if (value := _metric_total_value(row)) is not None
-                ]
+                total_values = [value for row in bucket_rows if (value := _metric_total_value(row)) is not None]
                 categorical = sorted(
                     {str(row["value_text"]) for row in bucket_rows if row.get("value_text") is not None}
                 )
@@ -1250,7 +1221,10 @@ def query_health_metrics(
                     }
                 )
             aggregate_records.sort(
-                key=lambda row: (str(row["bucket"]), str(row["metric_name"]).casefold()),
+                key=lambda row: (
+                    str(row["bucket"]),
+                    str(row["metric_name"]).casefold(),
+                ),
                 reverse=True,
             )
             total_result_count = len(aggregate_records)
@@ -1265,7 +1239,9 @@ def query_health_metrics(
     duplicates_removed = archived_rows + overlap_removed
     raw_rows = matched_active + archived_rows
     duplicate_ratio = duplicates_removed / raw_rows if raw_rows else 0.0
-    status = "empty" if unique_rows == 0 else "partial" if duplicate_ratio > 0.05 else "ok"
+    fetch_complete = total_result_count <= limit
+    quality_complete = unique_rows > 0 and duplicate_ratio <= 0.05
+    status = "empty" if total_result_count == 0 else "partial" if duplicate_ratio > 0.05 or not fetch_complete else "ok"
 
     return {
         "status": status,
@@ -1280,7 +1256,13 @@ def query_health_metrics(
         },
         "records": records,
         "record_count": len(records),
-        "fetch": {"complete": total_result_count <= limit},
+        "total_result_count": total_result_count,
+        "fetch": {
+            "complete": fetch_complete,
+            "truncated": not fetch_complete,
+            "matched_results": total_result_count,
+            "returned_results": len(records),
+        },
         "deduplication": {
             "applied": True,
             "raw_rows": raw_rows,
@@ -1299,8 +1281,9 @@ def query_health_metrics(
             "confidence": "low" if duplicate_ratio > 0.05 else "medium",
         },
         "data_quality": {
-            "complete": status == "ok",
-            "baseline_eligible": status == "ok",
+            "complete": quality_complete,
+            "baseline_eligible": quality_complete,
+            "quality_flags": ["duplicate_sources"] if duplicate_ratio > 0.05 else [],
         },
         "note": "Cumulative metrics are deduplicated before aggregation; missing values remain null.",
     }
@@ -1311,7 +1294,7 @@ def query_health_events(
     categories: list[str] | None = None,
     start_time: str | None = None,
     end_time: str | None = None,
-    limit: int = 100,
+    limit: int = 20,
     output_format: Literal["concise", "detailed"] = "concise",
     timezone: str = "UTC",
 ) -> dict[str, Any]:
@@ -1321,7 +1304,9 @@ def query_health_events(
         raise ValueError("categories accepts at most 20 names per query")
     default_start, default_end = default_time_window(30)
     start = normalize_query_time(start_time, timezone=timezone) or default_start
-    end = normalize_query_time(end_time, end_of_day=True, timezone=timezone) or default_end
+    end = normalize_query_time(end_time, timezone=timezone) or default_end
+    if start >= end:
+        raise ValueError("end_time must be later than start_time; ranges are half-open [start_time,end_time)")
     clauses = ["start_time >= ?", "start_time < ?"]
     params: list[Any] = [start, end]
     if categories:
@@ -1334,21 +1319,58 @@ def query_health_events(
 
     initialize_database(db_path)
     with connect(db_path) as connection:
+        total_event_count = int(
+            connection.execute(
+                f"SELECT COUNT(*) AS count FROM health_events WHERE {' AND '.join(clauses)}",
+                params,
+            ).fetchone()["count"]
+        )
         rows = connection.execute(
             f"""
             SELECT {fields}
             FROM health_events
-            WHERE {' AND '.join(clauses)}
+            WHERE {" AND ".join(clauses)}
             ORDER BY start_time DESC
             LIMIT ?
             """,
             (*params, limit),
         ).fetchall()
     records = [dict(row) for row in rows]
+    payload_budget_bytes = 32 * 1024
+    payload_item_limit_bytes = 16 * 1024
+    payload_bytes_remaining = payload_budget_bytes
+    payloads_included = 0
+    payloads_omitted = 0
     if output_format == "detailed":
         for record in records:
-            record["payload"] = json.loads(record.pop("payload_json"))
+            payload_json = record.pop("payload_json")
+            payload_size_bytes = len(payload_json.encode("utf-8"))
+            payload = json.loads(payload_json)
+            if payload_size_bytes <= payload_item_limit_bytes and payload_size_bytes <= payload_bytes_remaining:
+                record["payload"] = payload
+                payload_bytes_remaining -= payload_size_bytes
+                payloads_included += 1
+                continue
+            payloads_omitted += 1
+            if isinstance(payload, dict):
+                collection_counts = {
+                    str(key): len(value) for key, value in payload.items() if isinstance(value, (dict, list))
+                }
+                top_level_keys = sorted(str(key) for key in payload)[:50]
+            else:
+                collection_counts = {"root": len(payload)} if isinstance(payload, list) else {}
+                top_level_keys = []
+            record["payload_summary"] = {
+                "omitted": True,
+                "reason": "bounded_mcp_response",
+                "size_bytes": payload_size_bytes,
+                "top_level_keys": top_level_keys,
+                "collection_counts": collection_counts,
+            }
+    fetch_complete = total_event_count <= limit
+    payloads_complete = payloads_omitted == 0
     return {
+        "status": ("empty" if total_event_count == 0 else "ok" if fetch_complete and payloads_complete else "partial"),
         "query": {
             "categories": categories or [],
             "start_time": start,
@@ -1359,6 +1381,26 @@ def query_health_events(
         },
         "events": records,
         "event_count": len(records),
+        "total_event_count": total_event_count,
+        "fetch": {
+            "complete": fetch_complete,
+            "truncated": not fetch_complete,
+            "matched_events": total_event_count,
+            "returned_events": len(records),
+        },
+        "payloads": {
+            "requested": output_format == "detailed",
+            "complete": payloads_complete,
+            "included": payloads_included,
+            "omitted": payloads_omitted,
+            "total_budget_bytes": payload_budget_bytes,
+            "per_event_limit_bytes": payload_item_limit_bytes,
+        },
+        "data_quality": {
+            "complete": total_event_count > 0,
+            "missing_fields": [],
+            "quality_flags": ["oversized_payload_omitted"] if payloads_omitted else [],
+        },
     }
 
 

@@ -46,26 +46,27 @@ Retrieve the separate MCP token directly on the server with:
 sudo cat /etc/apple-health-mcp/mcp-token
 ```
 
-The server exposes thirteen read-only tools.
+The server exposes thirteen read-only tools. The names below are the exact `tools/list` / `tools/call.name` wire names.
+Some MCP hosts display an `AppleHealth:` prefix in their UI; do not include that display prefix in raw JSON-RPC calls.
 
 Primary scene tools:
 
-- `AppleHealth:guide`
-- `AppleHealth:get_sleep_summary`
-- `AppleHealth:get_sleep_trend`
-- `AppleHealth:get_recovery_snapshot`
-- `AppleHealth:get_daily_activity`
-- `AppleHealth:get_activity_trend`
-- `AppleHealth:list_workouts`
-- `AppleHealth:get_workout_detail`
-- `AppleHealth:compare_workouts`
-- `AppleHealth:get_health_overview`
+- `guide`
+- `get_sleep_summary`
+- `get_sleep_trend`
+- `get_recovery_snapshot`
+- `get_daily_activity`
+- `get_activity_trend`
+- `list_workouts`
+- `get_workout_detail`
+- `compare_workouts`
+- `get_health_overview`
 
 Fallback/debug tools:
 
-- `AppleHealth:list_available_data`
-- `AppleHealth:query_health_metrics`
-- `AppleHealth:query_health_events`
+- `list_available_data`
+- `query_health_metrics`
+- `query_health_events`
 
 Detailed scene outputs return requested/actual ranges, semantic summaries, personal-baseline comparison, bounded
 highlights, `fetch`, `coverage`, lifecycle state, and data quality. Concise outputs use smaller scene-specific contracts.
@@ -76,7 +77,14 @@ days expose `period.is_closed=false`; sleep instead separates `sleep_session.is_
 `output_format=concise` omits capabilities, raw payloads, sources, derivation lists, full difference maps, and repeated
 per-metric windows/sample metadata.
 `output_format=detailed` adds semantic quality and normalization metadata, but raw HealthKit payloads remain exclusive to
-the fallback query tools with raw+detailed mode.
+the fallback query tools. Oversized event payloads are replaced by a bounded key/count summary and return
+`status=partial` with `payloads.complete=false`.
+
+Fallback time filters use local half-open ranges: `[start_time,end_time)`. A date-only end value means local midnight
+at the start of that date, not the end of that date. Sleep-analysis fallback queries use date-only wake-date boundaries.
+Reversed or equal ranges are rejected. `query_health_metrics` requires one to ten exact `metric_names`; discover them
+with `list_available_data`. Metric/event result limits are explicit, and truncation is reported through
+`status=partial`, `fetch.complete=false`, and matched/returned counts.
 
 ## Semantic HTTP API
 
@@ -101,7 +109,7 @@ Workout scene APIs return compact session summaries and sensor coverage without 
 heart-rate samples. Cycle-tracking events are detected in capabilities and remain available through the raw-event
 fallback until a dedicated conversational scene contract is defined.
 
-For lossless debugging, call `AppleHealth:query_health_metrics` with `aggregation="raw"` and
+For lossless metric debugging, call `query_health_metrics` with explicit `metric_names`, `aggregation="raw"`, and
 `output_format="detailed"`. The response then includes the complete original exported sample alongside normalized
 columns. Overlapping exports are reconciled by metric/source/time bucket so the latest value is queried while every
 original request remains retained for audit and future reprocessing.

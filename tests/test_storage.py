@@ -56,7 +56,7 @@ PAYLOAD = {
                         "deep": 1.5,
                         "rem": 2.0,
                         "inBed": 8.0,
-                    }
+                    },
                 ],
             },
         ],
@@ -87,7 +87,12 @@ def test_ingestion_deduplication_and_queries(tmp_path: Path) -> None:
 
     available = list_available_data(db_path, "detailed")
     names = {item["metric_name"] for item in available["metrics"]}
-    assert {"step_count", "sleep_analysis", "sleep_analysis.deep", "sleep_analysis.rem"} <= names
+    assert {
+        "step_count",
+        "sleep_analysis",
+        "sleep_analysis.deep",
+        "sleep_analysis.rem",
+    } <= names
     assert available["event_categories"][0]["category"] == "workouts"
 
     raw_metrics = query_health_metrics(
@@ -169,7 +174,9 @@ def test_ingestion_deduplication_and_queries(tmp_path: Path) -> None:
     assert rebuilt["events_after"] == 1
 
 
-def test_source_variant_idempotency_timezone_and_source_priority(tmp_path: Path) -> None:
+def test_source_variant_idempotency_timezone_and_source_priority(
+    tmp_path: Path,
+) -> None:
     db_path = tmp_path / "health.db"
 
     def payload(source: str, *, qty: float = 25, record_id: str | None = None) -> dict:
@@ -180,11 +187,7 @@ def test_source_variant_idempotency_timezone_and_source_priority(tmp_path: Path)
         }
         if record_id:
             sample["uuid"] = record_id
-        return {
-            "data": {
-                "metrics": [{"name": "step_count", "units": "count", "data": [sample]}]
-            }
-        }
+        return {"data": {"metrics": [{"name": "step_count", "units": "count", "data": [sample]}]}}
 
     inserted_counts = []
     for index, source in enumerate(
@@ -225,9 +228,9 @@ def test_source_variant_idempotency_timezone_and_source_priority(tmp_path: Path)
             {"session-id": f"repeat-file-{index}"},
         )
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM metric_samples WHERE metric_name='step_count'"
-        ).fetchone()[0] == 1
+        assert (
+            connection.execute("SELECT COUNT(*) FROM metric_samples WHERE metric_name='step_count'").fetchone()[0] == 1
+        )
 
     boundary_payload = {
         "data": {
@@ -236,9 +239,24 @@ def test_source_variant_idempotency_timezone_and_source_priority(tmp_path: Path)
                     "name": "step_count",
                     "units": "count",
                     "data": [
-                        {"uuid": "early", "source": "iPhone", "qty": 10, "date": "2026-07-18 00:01:00 +0800"},
-                        {"uuid": "late", "source": "iPhone", "qty": 20, "date": "2026-07-18 23:59:00 +0800"},
-                        {"uuid": "boundary", "source": "iPhone", "qty": 99, "date": "2026-07-19 00:00:00 +0800"},
+                        {
+                            "uuid": "early",
+                            "source": "iPhone",
+                            "qty": 10,
+                            "date": "2026-07-18 00:01:00 +0800",
+                        },
+                        {
+                            "uuid": "late",
+                            "source": "iPhone",
+                            "qty": 20,
+                            "date": "2026-07-18 23:59:00 +0800",
+                        },
+                        {
+                            "uuid": "boundary",
+                            "source": "iPhone",
+                            "qty": 99,
+                            "date": "2026-07-19 00:00:00 +0800",
+                        },
                     ],
                 }
             ]
@@ -268,8 +286,18 @@ def test_source_variant_idempotency_timezone_and_source_priority(tmp_path: Path)
                     "name": "step_count",
                     "units": "count",
                     "data": [
-                        {"uuid": "watch-overlap", "source": "Apple Watch", "qty": 12, "date": "2026-07-18 14:00:00 +0800"},
-                        {"uuid": "phone-overlap", "source": "iPhone", "qty": 12, "date": "2026-07-18 14:00:00 +0800"},
+                        {
+                            "uuid": "watch-overlap",
+                            "source": "Apple Watch",
+                            "qty": 12,
+                            "date": "2026-07-18 14:00:00 +0800",
+                        },
+                        {
+                            "uuid": "phone-overlap",
+                            "source": "iPhone",
+                            "qty": 12,
+                            "date": "2026-07-18 14:00:00 +0800",
+                        },
                     ],
                 }
             ]
@@ -339,7 +367,11 @@ def test_historical_duplicate_archive_and_repair(tmp_path: Path) -> None:
                     "name": "step_count",
                     "units": "count",
                     "data": [
-                        {"source": "Apple Watch|iPhone", "qty": 25, "date": "2026-07-18 13:56:00 +0800"}
+                        {
+                            "source": "Apple Watch|iPhone",
+                            "qty": 25,
+                            "date": "2026-07-18 13:56:00 +0800",
+                        }
                     ],
                 }
             ]
@@ -374,3 +406,189 @@ def test_historical_duplicate_archive_and_repair(tmp_path: Path) -> None:
     with sqlite3.connect(db_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM metric_samples").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM metric_sample_duplicates").fetchone()[0] == 1
+
+
+def test_half_open_ranges_and_truncation_contracts(tmp_path: Path) -> None:
+    db_path = tmp_path / "health.db"
+    payload = {
+        "data": {
+            "metrics": [
+                {
+                    "name": "step_count",
+                    "units": "count",
+                    "data": [
+                        {
+                            "uuid": "step-early",
+                            "source": "iPhone",
+                            "qty": 10,
+                            "date": "2026-07-18 00:01:00 +0800",
+                        },
+                        {
+                            "uuid": "step-late",
+                            "source": "iPhone",
+                            "qty": 20,
+                            "date": "2026-07-18 23:59:00 +0800",
+                        },
+                        {
+                            "uuid": "step-boundary",
+                            "source": "iPhone",
+                            "qty": 99,
+                            "date": "2026-07-19 00:00:00 +0800",
+                        },
+                    ],
+                }
+            ],
+            "workouts": [
+                {
+                    "id": "workout-early",
+                    "name": "Walking",
+                    "start": "2026-07-18 08:00:00 +0800",
+                    "end": "2026-07-18 08:30:00 +0800",
+                    "duration": 1800,
+                },
+                {
+                    "id": "workout-late",
+                    "name": "Walking",
+                    "start": "2026-07-18 22:00:00 +0800",
+                    "end": "2026-07-18 22:30:00 +0800",
+                    "duration": 1800,
+                },
+                {
+                    "id": "workout-boundary",
+                    "name": "Walking",
+                    "start": "2026-07-19 00:00:00 +0800",
+                    "end": "2026-07-19 00:30:00 +0800",
+                    "duration": 1800,
+                },
+            ],
+        }
+    }
+    store_ingestion(db_path, payload, json.dumps(payload), {"session-id": "range-contract"})
+
+    metrics = query_health_metrics(
+        db_path,
+        metric_names=["step_count"],
+        start_time="2026-07-18",
+        end_time="2026-07-19",
+        aggregation="raw",
+        limit=10,
+        timezone="Asia/Shanghai",
+    )
+    assert metrics["status"] == "ok"
+    assert metrics["total_result_count"] == 2
+    assert {record["numeric_value"] for record in metrics["records"]} == {10, 20}
+    assert metrics["fetch"] == {
+        "complete": True,
+        "truncated": False,
+        "matched_results": 2,
+        "returned_results": 2,
+    }
+
+    truncated_metrics = query_health_metrics(
+        db_path,
+        metric_names=["step_count"],
+        start_time="2026-07-18",
+        end_time="2026-07-19",
+        aggregation="raw",
+        limit=1,
+        timezone="Asia/Shanghai",
+    )
+    assert truncated_metrics["status"] == "partial"
+    assert truncated_metrics["fetch"]["complete"] is False
+    assert truncated_metrics["fetch"]["truncated"] is True
+    assert truncated_metrics["fetch"]["matched_results"] == 2
+    assert truncated_metrics["fetch"]["returned_results"] == 1
+    assert truncated_metrics["data_quality"]["complete"] is True
+
+    events = query_health_events(
+        db_path,
+        categories=["workouts"],
+        start_time="2026-07-18",
+        end_time="2026-07-19",
+        limit=10,
+        timezone="Asia/Shanghai",
+    )
+    assert events["status"] == "ok"
+    assert events["total_event_count"] == 2
+    assert {event["event_type"] for event in events["events"]} == {"Walking"}
+    assert events["fetch"]["complete"] is True
+
+    truncated_events = query_health_events(
+        db_path,
+        categories=["workouts"],
+        start_time="2026-07-18",
+        end_time="2026-07-19",
+        limit=1,
+        timezone="Asia/Shanghai",
+    )
+    assert truncated_events["status"] == "partial"
+    assert truncated_events["fetch"] == {
+        "complete": False,
+        "truncated": True,
+        "matched_events": 2,
+        "returned_events": 1,
+    }
+
+    large_event_payload = {
+        "data": {
+            "workouts": [
+                {
+                    "id": "workout-large",
+                    "name": "Outdoor Cycling",
+                    "start": "2026-07-18 12:00:00 +0800",
+                    "end": "2026-07-18 13:00:00 +0800",
+                    "duration": 3600,
+                    "route": [{"latitude": 31.2, "longitude": 121.5, "index": index} for index in range(2000)],
+                }
+            ]
+        }
+    }
+    store_ingestion(
+        db_path,
+        large_event_payload,
+        json.dumps(large_event_payload),
+        {"session-id": "large-event"},
+    )
+    bounded_detailed = query_health_events(
+        db_path,
+        categories=["workouts"],
+        start_time="2026-07-18",
+        end_time="2026-07-19",
+        limit=10,
+        output_format="detailed",
+        timezone="Asia/Shanghai",
+    )
+    assert bounded_detailed["status"] == "partial"
+    assert bounded_detailed["fetch"]["complete"] is True
+    assert bounded_detailed["payloads"]["complete"] is False
+    assert bounded_detailed["payloads"]["omitted"] == 1
+    omitted = next(event for event in bounded_detailed["events"] if "payload_summary" in event)
+    assert omitted["payload_summary"]["reason"] == "bounded_mcp_response"
+    assert omitted["payload_summary"]["collection_counts"]["route"] == 2000
+    assert len(json.dumps(bounded_detailed, ensure_ascii=False).encode()) < 100000
+
+    empty_events = query_health_events(
+        db_path,
+        categories=["workouts"],
+        start_time="2026-07-20",
+        end_time="2026-07-21",
+        timezone="Asia/Shanghai",
+    )
+    assert empty_events["status"] == "empty"
+    assert empty_events["fetch"]["complete"] is True
+
+    with pytest.raises(ValueError, match="half-open"):
+        query_health_metrics(
+            db_path,
+            metric_names=["step_count"],
+            start_time="2026-07-19",
+            end_time="2026-07-18",
+            timezone="Asia/Shanghai",
+        )
+    with pytest.raises(ValueError, match="half-open"):
+        query_health_events(
+            db_path,
+            start_time="2026-07-19",
+            end_time="2026-07-18",
+            timezone="Asia/Shanghai",
+        )

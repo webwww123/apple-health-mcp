@@ -5,7 +5,8 @@ description = "Authenticated Apple Health ingestion API and read-only MCP server
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "mcp>=1.17,<2",
+    "mcp>=1.28,<1.29",
+    "pydantic>=2.11,<3",
     "starlette>=0.47,<1",
     "uvicorn[standard]>=0.35,<1",
 ]
